@@ -41,11 +41,11 @@ Next, measure cloud throughput before choosing a large budget:
 bash scripts/benchmark.sh
 ```
 
-This runs each of the three PPO variants for 50,000 steps and records elapsed time and steps/second in each run's `config.json`. Use those measurements to decide whether to keep or reduce the default budget before launching the full matrix. Also inspect TensorBoard's `rollout/ep_rew_mean`; 50k is a throughput check, not proof that PPO has learned to walk. If returns show no learning signal, run a longer single-seed pilot and review the configuration before paying for all 15 runs.
+This runs each of the three PPO variants for 50,000 steps and records elapsed time and steps/second in each run's `config.json`. Use those measurements to decide whether to keep or reduce the default budget before launching the full matrix. Also inspect TensorBoard's `rollout/ep_rew_mean`; 50k is a throughput check, not proof that PPO has learned to walk. If returns show no learning signal, run a longer single-seed pilot and review the configuration before paying for all 9 runs.
 
 ## Full experiment
 
-Default matrix: three variants × seeds 0, 1, 2, 3, 4 × 1,000,000 requested environment steps per run, followed by 100 deterministic episodes per evaluation condition. It is sequential and does not resume an interrupted PPO run. To survive SSH disconnects, run it inside `tmux`:
+Default matrix: three variants × seeds 0, 1, 2 × 1,500,000 requested environment steps per run, followed by 100 deterministic episodes per evaluation condition. That is 9 training runs; at the measured CPU throughput (~750–960 steps/s on a single thread) each run takes roughly 26–33 minutes, so the full matrix is about 4.5 hours. It is sequential and skips runs that already have both `final_model.zip` and `evaluation/summary.json`. Resuming is opt-in: without `RESUME=1` an interrupted run restarts from scratch. To survive SSH disconnects, run it inside `tmux`:
 
 ```bash
 mkdir -p runs
@@ -64,13 +64,13 @@ bash scripts/run_matrix.sh
 Override the budget or episode count if needed:
 
 ```bash
-TIMESTEPS=1500000 SEEDS="0 1 2 3 4" EPISODES=100 bash scripts/run_matrix.sh
+TIMESTEPS=3000000 SEEDS="0 1 2" EPISODES=100 bash scripts/run_matrix.sh
 ```
 
 The script runs jobs sequentially to keep CPU and memory use predictable. To launch an individual run manually:
 
 ```bash
-uv run python train.py --variant baseline --seed 0 --timesteps 1000000
+uv run python train.py --variant baseline --seed 0 --timesteps 1500000
 uv run python evaluate.py \
   --model runs/baseline/seed_0/final_model.zip \
   --variant baseline \
@@ -80,11 +80,33 @@ uv run python evaluate.py \
 
 The supported variants are `baseline`, `ppo-normalized`, and `truly-ppo`. The script defaults its outputs to `runs/<variant>/seed_<seed>/`; the matrix script uses `runs/main/...` to separate the formal runs. Do not run variants into the same output directory.
 
+## Resuming an interrupted run
+
+If a run is stopped (SSH drop, crash, `Ctrl-C`), it can continue from its latest checkpoint instead of starting over. Resume is off by default; enable it explicitly:
+
+```bash
+RESUME=1 bash scripts/run_matrix.sh
+```
+
+With `RESUME=1`, `run_matrix.sh` passes `--resume` to every training job, which loads `final_model.zip` when it exists, otherwise the checkpoint with the largest step count under `checkpoints/`, together with the matching normalization statistics (checkpoint statistics are stored as `checkpoints/ppo_walker2d_vecnormalize_<steps>_steps.pkl`). Without the flag, a partially trained run restarts from zero: its `final_model.zip`, `vecnormalize.pkl`, and checkpoints are deleted first, so a later `RESUME=1` cannot pick up artifacts from the discarded run. Earlier TensorBoard event files and `evaluation/` outputs are left in place until overwritten. `--timesteps` always means the absolute budget for the run: a resumed run trains only the remaining steps, and the linear learning-rate schedule keeps annealing against the original budget rather than restarting. To resume manually:
+
+```bash
+uv run python train.py --variant truly-ppo --seed 1 --timesteps 1500000 \
+  --run-dir runs/main/truly-ppo/seed_1 --resume
+uv run python train.py --variant truly-ppo --seed 1 --timesteps 1500000 \
+  --run-dir runs/main/truly-ppo/seed_1 \
+  --resume runs/main/truly-ppo/seed_1/checkpoints/ppo_walker2d_1000000_steps.zip
+```
+
+`--resume` without a value auto-detects the starting point in `--run-dir`; with a value it takes a run directory or a model `.zip`. A normalized run refuses to resume if its `vecnormalize.pkl` is missing, because the observation statistics cannot be reconstructed.
+
+Limits: the rollout buffer is not checkpointed, so the rollout in flight when the process died (at most `n_steps - 1 = 2047` steps) is discarded, and the environment RNG stream is not restored. A resumed run is a close continuation, not a bit-exact one. TensorBoard appends to the run's existing event directory, and `config.json` records `resumed_from`, `resume_start_timesteps`, and `resume_history`.
+
 ## Outputs
 
 Each training directory contains:
 
-- `config.json`: requested and actual timesteps, PPO settings, normalization settings, package versions, and timing.
+- `config.json`: requested and actual timesteps, PPO settings, normalization settings, package versions, timing, and resume history.
 - `final_model.zip` and periodic checkpoints; normalized variants also save `vecnormalize.pkl` for correctly normalized evaluation.
 - `tensorboard/`: TensorBoard event files.
 - `evaluation/episodes.csv` and `evaluation/summary.json`: per-episode and per-condition returns, forward velocity, displacement, fall rate, and time-limit rate.
@@ -105,4 +127,4 @@ Keep the cloud run directory intact and download/archive it before deleting the 
 
 ## Interpretation
 
-Use nominal mean return as the primary outcome for each seed. Report the paired per-seed differences for `ppo-normalized` minus `baseline`, `truly-ppo` minus `ppo-normalized`, and `truly-ppo` minus `baseline`; summarize means and sample standard deviations across the five seeds. Report both held-out conditions separately as secondary robustness measures. Five seeds provide a more informative comparison than three, but are still a modest sample and should not be presented as definitive statistical proof.
+Use nominal mean return as the primary outcome for each seed. Report the paired per-seed differences for `ppo-normalized` minus `baseline`, `truly-ppo` minus `ppo-normalized`, and `truly-ppo` minus `baseline`; summarize means and sample standard deviations across the three seeds. Report both held-out conditions separately as secondary robustness measures. Three seeds is a small sample: it cannot support significance claims, and a single divergent seed dominates the mean and standard deviation. Prefer reporting all three per-seed values and the paired differences rather than only the aggregate, and treat any ranking as preliminary unless the paired differences are consistent across all three seeds. Adding seeds 3 and 4 later with `SEEDS="3 4"` is cheap if the budget allows.
