@@ -4,7 +4,8 @@ set -euo pipefail
 uv sync --locked
 
 TIMESTEPS="${TIMESTEPS:-50000}"
-for variant in baseline domain-rand; do
+VARIANTS="${VARIANTS:-baseline ppo-normalized truly-ppo}"
+for variant in $VARIANTS; do
   uv run python train.py \
     --variant "$variant" \
     --seed 0 \

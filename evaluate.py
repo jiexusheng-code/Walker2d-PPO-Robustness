@@ -8,8 +8,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from envs import make_env
+from truly_ppo import TrulyPPO
 
 
 CONDITIONS = {
@@ -17,14 +19,21 @@ CONDITIONS = {
     "heldout_low": (0.7, 0.7),
     "heldout_high": (1.3, 1.3),
 }
+VARIANTS = ("baseline", "ppo-normalized", "truly-ppo")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a Walker2d PPO model.")
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--variant", choices=VARIANTS, required=True)
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=40_000)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--vecnormalize", type=Path,
+        help="VecNormalize statistics for normalized variants "
+             "(default: vecnormalize.pkl next to --model).",
+    )
     parser.add_argument(
         "--conditions", nargs="+", choices=tuple(CONDITIONS),
         default=list(CONDITIONS),
@@ -32,6 +41,15 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.episodes < 1:
         parser.error("--episodes must be at least 1")
+    if not args.model.exists():
+        parser.error(f"model not found: {args.model}")
+    if args.variant == "baseline":
+        if args.vecnormalize is not None:
+            parser.error("--vecnormalize is only valid for normalized variants")
+    else:
+        stats_path = args.vecnormalize or (args.model.parent / "vecnormalize.pkl")
+        if not stats_path.exists():
+            parser.error(f"VecNormalize statistics not found: {stats_path}")
     return args
 
 
@@ -39,9 +57,12 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(1)
-    model = PPO.load(args.model, device="cpu")
+    model_class = TrulyPPO if args.variant == "truly-ppo" else PPO
+    model = model_class.load(args.model, device="cpu")
     rows: list[dict[str, object]] = []
     summary: dict[str, dict[str, float]] = {}
+    normalized = args.variant != "baseline"
+    normalization_path = args.vecnormalize or (args.model.parent / "vecnormalize.pkl")
 
     for condition in args.conditions:
         friction_scale, actuator_scale = CONDITIONS[condition]
@@ -49,6 +70,16 @@ def main() -> None:
             friction_scale=friction_scale,
             actuator_scale=actuator_scale,
         )
+        normalizer = None
+        if normalized:
+            vec_env = DummyVecEnv([lambda: make_env(
+                friction_scale=friction_scale,
+                actuator_scale=actuator_scale,
+            )])
+            normalizer = VecNormalize.load(normalization_path, vec_env)
+            normalizer.training = False
+            normalizer.norm_reward = False
+
         returns: list[float] = []
         lengths: list[int] = []
         for episode in range(args.episodes):
@@ -60,7 +91,8 @@ def main() -> None:
             length = 0
             terminated = truncated = False
             while not (terminated or truncated):
-                action, _ = model.predict(obs, deterministic=True)
+                policy_obs = normalizer.normalize_obs(obs) if normalizer else obs
+                action, _ = model.predict(policy_obs, deterministic=True)
                 obs, reward, terminated, truncated, info = env.step(action)
                 episode_return += float(reward)
                 forward_velocities.append(float(info["x_velocity"]))
@@ -69,6 +101,7 @@ def main() -> None:
             returns.append(episode_return)
             lengths.append(length)
             rows.append({
+                "variant": args.variant,
                 "condition": condition,
                 "episode": episode,
                 "seed": args.seed + episode,
@@ -82,6 +115,8 @@ def main() -> None:
                 "actuator_scale": actuator_scale,
             })
         env.close()
+        if normalizer:
+            normalizer.close()
         condition_rows = rows[-args.episodes:]
         summary[condition] = {
             "episodes": args.episodes,
@@ -117,6 +152,11 @@ def main() -> None:
         writer.writerows(rows)
     report = {
         "model": str(args.model),
+        "variant": args.variant,
+        "normalization": {
+            "enabled": normalized,
+            "vecnormalize": str(normalization_path) if normalized else None,
+        },
         "episodes_per_condition": args.episodes,
         "base_seed": args.seed,
         "conditions": summary,
