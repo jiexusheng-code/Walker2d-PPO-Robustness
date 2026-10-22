@@ -2,7 +2,7 @@
 set -euo pipefail
 
 uv sync --locked
-uv run python -m unittest discover -s tests -v
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" uv run python -m unittest discover -s tests -v
 
 for variant in baseline domain-rand; do
   run_dir="runs/smoke/${variant}"
