@@ -12,17 +12,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 Action = Literal["skip", "evaluate", "train", "resume", "error"]
-TRAINING_VARIANTS = ("ppo-reference", "truly-ppo")
+TRAINING_VARIANTS = ("ppo-reference", "truly-ppo", "rpo")
 REFERENCE_PROFILE = "ppo-reference"
 ACTOR_OBJECTIVES = {
     "ppo-reference": "ppo_clip",
     "truly-ppo": "truly_ppo_kl_triggered_rollback",
+    "rpo": "rpo_uniform_mean_perturbation",
 }
 REQUIRED_CONDITIONS = {"nominal", "heldout_low", "heldout_high"}
 INCOMPLETE_STATUSES = {"running", "interrupted", "failed"}
@@ -168,7 +170,7 @@ def evaluation_current(
 
 
 def _config_matches(
-    config: dict, variant: str, seed: int
+    config: dict, variant: str, seed: int, rpo_alpha: float | None
 ) -> tuple[bool, str]:
     if config.get("variant") != variant:
         return False, (
@@ -197,6 +199,18 @@ def _config_matches(
         return False, (
             f"actor objective {actor_type!r} != {expected_actor!r}"
         )
+    if variant == "rpo":
+        rpo = actor.get("rpo") if isinstance(actor, dict) else None
+        alpha = rpo.get("alpha") if isinstance(rpo, dict) else None
+        if not isinstance(alpha, (int, float)) or isinstance(alpha, bool):
+            return False, "actor rpo alpha is missing"
+        if rpo_alpha is not None and not math.isclose(
+            float(alpha), rpo_alpha, rel_tol=0.0, abs_tol=1e-12
+        ):
+            return False, (
+                f"actor rpo alpha {alpha!r} != requested RPO_ALPHA "
+                f"{rpo_alpha!r}"
+            )
     return True, "configuration matches"
 
 
@@ -209,6 +223,23 @@ def _has_resume_point(run_dir: Path) -> bool:
     )
 
 
+def parse_requested_alpha(value: object) -> tuple[float | None, str | None]:
+    """Return ``(alpha, error)`` for an optional requested RPO alpha."""
+    if value is None:
+        return None, None
+    try:
+        alpha = float(value)
+    except (TypeError, ValueError):
+        return None, (
+            f"RPO_ALPHA must be a finite, non-negative number, got {value!r}"
+        )
+    if not math.isfinite(alpha) or alpha < 0.0:
+        return None, (
+            f"RPO_ALPHA must be a finite, non-negative number, got {value!r}"
+        )
+    return alpha, None
+
+
 def plan_run(
     run_dir: Path,
     *,
@@ -218,6 +249,7 @@ def plan_run(
     episodes: int,
     eval_seed: int,
     resume: bool,
+    rpo_alpha: object = None,
 ) -> RunPlan:
     run_dir = Path(run_dir)
     if variant not in TRAINING_VARIANTS:
@@ -226,6 +258,15 @@ def plan_run(
             f"unsupported training variant {variant!r}; this project trains "
             f"only {', '.join(TRAINING_VARIANTS)}. Historical baseline models "
             f"are supported only by evaluate.py",
+            None,
+        )
+    alpha, alpha_error = parse_requested_alpha(rpo_alpha)
+    if alpha_error is not None:
+        return RunPlan("error", alpha_error, None)
+    if alpha is not None and variant != "rpo":
+        return RunPlan(
+            "error",
+            f"RPO_ALPHA is only valid for the rpo variant, not {variant!r}",
             None,
         )
 
@@ -240,7 +281,9 @@ def plan_run(
             None,
         )
     if config is not None:
-        config_ok, config_reason = _config_matches(config, variant, seed)
+        config_ok, config_reason = _config_matches(
+            config, variant, seed, alpha
+        )
         if not config_ok:
             return RunPlan(
                 "error",
@@ -348,6 +391,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     plan_parser.add_argument("--episodes", type=int, required=True)
     plan_parser.add_argument("--eval-seed", type=int, required=True)
     plan_parser.add_argument("--resume", action="store_true")
+    plan_parser.add_argument(
+        "--rpo-alpha",
+        help="Requested RPO alpha; must match a completed run's config.",
+    )
     return parser.parse_args(argv)
 
 
@@ -363,6 +410,7 @@ def main(argv: list[str] | None = None) -> int:
         episodes=args.episodes,
         eval_seed=args.eval_seed,
         resume=args.resume,
+        rpo_alpha=args.rpo_alpha,
     )
     print(f"{plan.action}|{plan.reason}")
     return 3 if plan.action == "error" else 0

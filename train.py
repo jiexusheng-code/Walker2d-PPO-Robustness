@@ -29,17 +29,20 @@ from diagnostics import (
     source_hashes,
 )
 from envs import make_env
+from rpo_ppo import DEFAULT_RPO_ALPHA, RPO, RPO_SOURCE_URL, validate_rpo_alpha
 from truly_ppo import TrulyPPO
 
 
 REFERENCE_VARIANT = "ppo-reference"
 TRULY_VARIANT = "truly-ppo"
-VARIANTS = (REFERENCE_VARIANT, TRULY_VARIANT)
+RPO_VARIANT = "rpo"
+VARIANTS = (REFERENCE_VARIANT, TRULY_VARIANT, RPO_VARIANT)
 DEFAULT_VARIANT = REFERENCE_VARIANT
 REFERENCE_PROFILE = REFERENCE_VARIANT
 ACTOR_OBJECTIVES = {
     REFERENCE_VARIANT: "ppo_clip",
     TRULY_VARIANT: "truly_ppo_kl_triggered_rollback",
+    RPO_VARIANT: "rpo_uniform_mean_perturbation",
 }
 CHECKPOINT_PREFIX = "ppo_walker2d"
 CHECKPOINT_PATTERN = re.compile(r"^(?P<prefix>.+)_(?P<steps>\d+)_steps\.zip$")
@@ -51,6 +54,10 @@ REFERENCE_SOURCE_URL = (
 TRULY_PPO_SOURCE = (
     "Y. Wang, H. He, C. Wen, X. Tan, Truly Proximal Policy Optimization "
     "(arXiv:1903.07940, 2019; extended 2020 version)"
+)
+RPO_SOURCE = (
+    "CleanRL RPO continuous-action implementation, vwxyzjn/cleanrl "
+    f"rpo_continuous_action.py ({RPO_SOURCE_URL})"
 )
 REFERENCE_PPO_KWARGS = {
     "n_steps": 512,
@@ -139,7 +146,16 @@ def make_eval_env():
 
 def model_class_for_variant(variant: str):
     _require_supported_variant(variant)
-    return TrulyPPO if variant == TRULY_VARIANT else PPO
+    if variant == TRULY_VARIANT:
+        return TrulyPPO
+    if variant == RPO_VARIANT:
+        return RPO
+    return PPO
+
+
+def algorithm_name_for_variant(variant: str) -> str:
+    _require_supported_variant(variant)
+    return model_class_for_variant(variant).__name__
 
 
 def model_kwargs_for_variant(variant: str) -> dict:
@@ -147,12 +163,28 @@ def model_kwargs_for_variant(variant: str) -> dict:
     return REFERENCE_PPO_KWARGS
 
 
+def model_constructor_kwargs_for_variant(
+    variant: str, rpo_alpha: float | None = None
+) -> dict:
+    """Shared PPO settings plus the variant-only constructor argument."""
+    kwargs = dict(model_kwargs_for_variant(variant))
+    if variant == RPO_VARIANT:
+        kwargs["rpo_alpha"] = (
+            DEFAULT_RPO_ALPHA
+            if rpo_alpha is None
+            else validate_rpo_alpha(rpo_alpha)
+        )
+    return kwargs
+
+
 def learning_rate_for_variant(variant: str) -> float:
     _require_supported_variant(variant)
     return REFERENCE_LEARNING_RATE
 
 
-def actor_config_for_variant(variant: str) -> dict:
+def actor_config_for_variant(
+    variant: str, rpo_alpha: float | None = None
+) -> dict:
     _require_supported_variant(variant)
     if variant == TRULY_VARIANT:
         return {
@@ -169,6 +201,31 @@ def actor_config_for_variant(variant: str) -> dict:
                 "note": (
                     "KL penalty inside the actor objective; no parameter or "
                     "optimizer state is restored."
+                ),
+            },
+        }
+    if variant == RPO_VARIANT:
+        alpha = (
+            DEFAULT_RPO_ALPHA
+            if rpo_alpha is None
+            else validate_rpo_alpha(rpo_alpha)
+        )
+        return {
+            "objective": ACTOR_OBJECTIVES[variant],
+            "clip_range_used": True,
+            "kl_rollback": None,
+            "rpo": {
+                "alpha": alpha,
+                "noise": (
+                    "elementwise Uniform(-alpha, alpha) added to the policy "
+                    "mean"
+                ),
+                "scope": (
+                    "training-update log-prob only; rollout and deterministic "
+                    "prediction use the unperturbed Gaussian"
+                ),
+                "alpha_zero": (
+                    "alpha=0 bypasses the RNG draw and is exactly PPO-Clip"
                 ),
             },
         }
@@ -245,10 +302,10 @@ def validate_resume(
 ) -> None:
     """Reject a model whose saved configuration does not match this run.
 
-    Both arms use the same strict reference profile. The only permitted
-    difference is the recorded actor objective. This also rejects a legacy
-    ``truly-ppo`` run that used the old 2048-step recipe, rather than silently
-    resuming it into the new shared profile.
+    Every variant uses the same strict reference profile. The only permitted
+    difference is the recorded actor objective (and RPO's alpha). This also
+    rejects a legacy ``truly-ppo`` run that used the old 2048-step recipe,
+    rather than silently resuming it into the new shared profile.
     """
     config_path = run_dir / "config.json"
     if not config_path.exists():
@@ -263,7 +320,7 @@ def validate_resume(
         )
     mismatches: list[str] = []
     variant = args.variant
-    expected_algorithm = "TrulyPPO" if variant == TRULY_VARIANT else "PPO"
+    expected_algorithm = algorithm_name_for_variant(variant)
 
     if config.get("variant") != variant:
         mismatches.append(
@@ -402,6 +459,23 @@ def validate_resume(
                 f"model truly_delta {getattr(model, 'truly_delta', None)!r} "
                 f"!= {TrulyPPO.truly_delta!r}"
             )
+    if variant == RPO_VARIANT:
+        rpo = actor.get("rpo") or {}
+        saved_alpha = rpo.get("alpha")
+        model_alpha = getattr(model, "rpo_alpha", None)
+        if not _same_number(saved_alpha, model_alpha):
+            mismatches.append(
+                f"actor rpo alpha {saved_alpha!r} != model rpo_alpha "
+                f"{model_alpha!r}"
+            )
+        requested_alpha = getattr(args, "rpo_alpha", None)
+        if requested_alpha is not None and not _same_number(
+            requested_alpha, model_alpha
+        ):
+            mismatches.append(
+                f"requested --rpo-alpha {requested_alpha!r} != model "
+                f"rpo_alpha {model_alpha!r}"
+            )
 
     if mismatches:
         raise SystemExit(
@@ -435,14 +509,15 @@ def build_run_config(
     variant = args.variant
     ppo_kwargs = model_kwargs_for_variant(variant)
     learning_rate = learning_rate_for_variant(variant)
+    rpo_alpha = getattr(args, "rpo_alpha", None)
     config = {
         "environment": "Walker2d-v5",
         "variant": variant,
         "profile": REFERENCE_PROFILE,
         "seed": args.seed,
         "requested_timesteps": args.timesteps,
-        "algorithm": "TrulyPPO" if variant == TRULY_VARIANT else "PPO",
-        "actor": actor_config_for_variant(variant),
+        "algorithm": algorithm_name_for_variant(variant),
+        "actor": actor_config_for_variant(variant, rpo_alpha),
         "resumed_from": str(resumed_from) if resumed_from is not None else None,
         "resume_start_timesteps": start_timesteps,
         "resume_history": resume_history,
@@ -483,8 +558,9 @@ def build_run_config(
                 "ported unchanged to v5)"
             ),
             "truly_ppo_source": TRULY_PPO_SOURCE,
+            "rpo_source": RPO_SOURCE,
             "shared_note": (
-                "Both arms share environment, normalization, network, "
+                "Every variant shares environment, normalization, network, "
                 "learning rate and schedule, rollout settings, value and "
                 "entropy coefficients, seed, evaluation, and budget. Only "
                 "the actor objective differs."
@@ -609,8 +685,8 @@ def resolve_resume(spec: str, run_dir: Path) -> tuple[Path, Path] | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Train one of the two shared-profile Walker2d-v5 arms: the "
-            "standard PPO-Clip reference or Truly PPO."
+            "Train one of the shared-profile Walker2d-v5 variants: the "
+            "standard PPO-Clip reference, Truly PPO, or RPO."
         )
     )
     parser.add_argument(
@@ -619,7 +695,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_VARIANT,
         help=(
             "ppo-reference trains standard PPO-Clip; truly-ppo replaces only "
-            "the actor objective with Truly PPO's KL-triggered rollback."
+            "the actor objective with Truly PPO's KL-triggered rollback; rpo "
+            "perturbs the policy mean with Uniform(-alpha, alpha) noise when "
+            "evaluating update actions."
         ),
     )
     parser.add_argument("--seed", type=int, required=True)
@@ -655,11 +733,28 @@ def parse_args() -> argparse.Namespace:
         default=50_000,
         help="RNG stream seed used at the start of every periodic eval.",
     )
+    parser.add_argument(
+        "--rpo-alpha",
+        type=float,
+        default=None,
+        help=(
+            "RPO perturbation half-width (finite and non-negative); only "
+            f"valid with --variant rpo. Defaults to {DEFAULT_RPO_ALPHA}. On "
+            "resume, defaults to the alpha stored in the checkpoint."
+        ),
+    )
     args = parser.parse_args()
     if args.eval_every < 0:
         parser.error("--eval-every must be >= 0")
     if args.eval_episodes < 1:
         parser.error("--eval-episodes must be at least 1")
+    if args.variant != RPO_VARIANT and args.rpo_alpha is not None:
+        parser.error("--rpo-alpha is only valid with --variant rpo")
+    if args.variant == RPO_VARIANT and args.rpo_alpha is not None:
+        try:
+            args.rpo_alpha = validate_rpo_alpha(args.rpo_alpha)
+        except ValueError as error:
+            parser.error(str(error))
     return args
 
 
@@ -676,8 +771,6 @@ def main() -> None:
     torch.set_num_threads(args.torch_threads)
     model_class = model_class_for_variant(args.variant)
     learning_rate = learning_rate_for_variant(args.variant)
-    model_kwargs = model_kwargs_for_variant(args.variant)
-
     try:
         resume_point = (
             resolve_resume(args.resume, run_dir)
@@ -720,6 +813,11 @@ def main() -> None:
         if resume_point is None:
             monitor_path = run_dir / "monitor.csv"
             env = make_training_env(monitor_path=monitor_path)
+            constructor_kwargs = model_constructor_kwargs_for_variant(
+                args.variant, getattr(args, "rpo_alpha", None)
+            )
+            if args.variant == RPO_VARIANT:
+                args.rpo_alpha = constructor_kwargs["rpo_alpha"]
             model = model_class(
                 "MlpPolicy",
                 env,
@@ -727,7 +825,7 @@ def main() -> None:
                 learning_rate=learning_rate,
                 tensorboard_log=str(run_dir / "tensorboard"),
                 verbose=1,
-                **model_kwargs,
+                **constructor_kwargs,
             )
         else:
             resumed_from, stats_path = resume_point
@@ -737,9 +835,21 @@ def main() -> None:
                 monitor_path=monitor_path,
                 monitor_append=monitor_path.exists(),
             )
-            model = model_class.load(
-                resumed_from, env=env, device="cpu", print_system_info=False
-            )
+            try:
+                model = model_class.load(
+                    resumed_from,
+                    env=env,
+                    device="cpu",
+                    print_system_info=False,
+                )
+            except ValueError as error:
+                raise SystemExit(
+                    f"error: cannot resume {args.variant} from "
+                    f"{resumed_from}: {error}"
+                ) from error
+            if args.variant == RPO_VARIANT and args.rpo_alpha is None:
+                # Unspecified alpha resumes the checkpoint's own value.
+                args.rpo_alpha = float(model.rpo_alpha)
             # Validate the saved model before overriding its schedules.
             validate_resume(run_dir, args, model)
             # `load` restores the pickled schedule; rebuild it from this module
@@ -787,6 +897,7 @@ def main() -> None:
                 repo_root / "diagnostics.py",
                 repo_root / "envs.py",
                 repo_root / "truly_ppo.py",
+                repo_root / "rpo_ppo.py",
             ]),
         )
         write_config(config_path, state)

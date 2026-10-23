@@ -183,6 +183,7 @@ class MatrixShellTests(ShellTestBase):
         self.assertEqual(len(best), 2)
         for line in best:
             self.assertIn("--vecnormalize", line)
+        self.assertFalse(any("--rpo-alpha" in line for line in calls))
 
     def test_old_variant_is_rejected_before_uv(self) -> None:
         self.env["VARIANTS"] = "baseline"
@@ -190,6 +191,29 @@ class MatrixShellTests(ShellTestBase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsupported training variant", result.stderr)
         self.assertFalse(self.calls.exists())
+
+    def test_explicit_rpo_variant_is_accepted(self) -> None:
+        self.env["VARIANTS"] = "rpo"
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        trains = [line for line in self.call_lines() if "train.py" in line]
+        self.assertEqual(len(trains), 1)
+        self.assertIn("--variant rpo", trains[0])
+
+    def test_rpo_alpha_is_forwarded_to_planning_and_training(self) -> None:
+        self.env["VARIANTS"] = "rpo"
+        self.env["RPO_ALPHA"] = "0.1"
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.call_lines()
+        planned = [
+            line for line in calls if "scripts/run_matrix_lib.py" in line
+        ]
+        self.assertEqual(len(planned), 1)
+        self.assertIn("--rpo-alpha 0.1", planned[0])
+        trains = [line for line in calls if "train.py" in line]
+        self.assertEqual(len(trains), 1)
+        self.assertIn("--rpo-alpha 0.1", trains[0])
 
     def test_skip_does_not_train_or_evaluate(self) -> None:
         self.env["PLAN_ACTION"] = "skip"

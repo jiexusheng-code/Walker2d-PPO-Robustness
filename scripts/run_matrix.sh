@@ -5,9 +5,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 cd "$REPO_ROOT"
 
-# Formal two-arm matrix. Both arms use the same shared reference profile; only
-# the actor objective differs. Defaults to one 1,000,000-step pilot per arm at
-# seed 0. Use SEEDS="0 1 2" only after reviewing seed 0.
+# Formal shared-profile matrix. Defaults to one 1,000,000-step pilot per arm
+# (ppo-reference and truly-ppo) at seed 0. Select rpo explicitly with
+# VARIANTS="rpo" (optionally RPO_ALPHA=0.5), and use SEEDS="0 1 2" only after
+# reviewing seed 0.
 TIMESTEPS="${TIMESTEPS:-1000000}"
 SEEDS="${SEEDS:-0}"
 EPISODES="${EPISODES:-100}"
@@ -17,7 +18,9 @@ EVAL_EVERY="${EVAL_EVERY:-50000}"
 EVAL_EPISODES="${EVAL_EPISODES:-10}"
 EVAL_SEED="${EVAL_SEED:-50000}"
 FINAL_EVAL_SEED="${FINAL_EVAL_SEED:-40000}"
-# New root for the formal two-arm comparison. Do not reuse runs/main, which
+# Optional RPO perturbation half-width; only passed when variant=rpo.
+RPO_ALPHA="${RPO_ALPHA:-}"
+# New root for the formal comparison. Do not reuse runs/main, which
 # holds the retired three-group history.
 RUNS_ROOT="${RUNS_ROOT:-runs/two_arm}"
 
@@ -43,17 +46,17 @@ if [ -z "$RUNS_ROOT" ]; then
 fi
 for variant in $VARIANTS; do
   case "$variant" in
-    ppo-reference|truly-ppo) ;;
+    ppo-reference|truly-ppo|rpo) ;;
     *)
       printf 'error: unsupported training variant: %s\n' "$variant" >&2
       printf '%s\n' \
-        'The two-arm matrix trains only ppo-reference and truly-ppo. Historical baseline models are evaluation-only.' >&2
+        'The matrix trains ppo-reference, truly-ppo, and rpo. Historical baseline models are evaluation-only.' >&2
       exit 1
       ;;
   esac
 done
 
-printf 'two-arm matrix: shared_profile=ppo-reference variants=%s seeds=%s timesteps=%s episodes=%s final_eval_seed=%s runs_root=%s\n' \
+printf 'shared-profile matrix: shared_profile=ppo-reference variants=%s seeds=%s timesteps=%s episodes=%s final_eval_seed=%s runs_root=%s\n' \
   "$VARIANTS" "$SEEDS" "$TIMESTEPS" "$EPISODES" "$FINAL_EVAL_SEED" "$RUNS_ROOT"
 
 uv sync --locked
@@ -96,6 +99,9 @@ for variant in $VARIANTS; do
     if [ "$RESUME" = "1" ]; then
       plan_args+=(--resume)
     fi
+    if [ "$variant" = "rpo" ] && [ -n "$RPO_ALPHA" ]; then
+      plan_args+=(--rpo-alpha "$RPO_ALPHA")
+    fi
 
     if ! plan="$(uv run python scripts/run_matrix_lib.py plan "${plan_args[@]}")"; then
       printf 'ERROR [%s seed %s]: %s\n' "$variant" "$seed" "${plan#*|}" >&2
@@ -126,6 +132,9 @@ for variant in $VARIANTS; do
         )
         if [ "$action" = "resume" ]; then
           train_args+=(--resume)
+        fi
+        if [ "$variant" = "rpo" ] && [ -n "$RPO_ALPHA" ]; then
+          train_args+=(--rpo-alpha "$RPO_ALPHA")
         fi
         uv run python train.py "${train_args[@]}"
         evaluate_run "$variant" "$run_dir"

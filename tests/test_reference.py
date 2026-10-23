@@ -28,6 +28,7 @@ def _args(
         eval_every=10_000,
         eval_episodes=10,
         eval_seed=50_000,
+        rpo_alpha=None,
     )
 
 
@@ -47,6 +48,7 @@ def _fake_model(variant: str = train.REFERENCE_VARIANT, **overrides):
         "n_envs": 1,
         "truly_alpha": train.TrulyPPO.truly_alpha,
         "truly_delta": train.TrulyPPO.truly_delta,
+        "rpo_alpha": train.RPO.DEFAULT_ALPHA,
     }
     values.update(overrides)
     return types.SimpleNamespace(**values)
@@ -85,7 +87,7 @@ def _write_config(
         "seed": seed,
         "profile": profile,
         "environment": "Walker2d-v5",
-        "algorithm": "TrulyPPO" if variant == train.TRULY_VARIANT else "PPO",
+        "algorithm": train.algorithm_name_for_variant(variant),
         "ppo": ppo,
         "normalization": (
             {"observations": True, "rewards": True}
@@ -102,10 +104,10 @@ def _write_config(
 
 
 class SharedProfileTests(unittest.TestCase):
-    def test_project_exposes_only_two_arms_with_one_profile(self) -> None:
+    def test_project_exposes_shared_profile_variants(self) -> None:
         self.assertEqual(
             train.VARIANTS,
-            (train.REFERENCE_VARIANT, train.TRULY_VARIANT),
+            (train.REFERENCE_VARIANT, train.TRULY_VARIANT, train.RPO_VARIANT),
         )
         self.assertEqual(train.DEFAULT_VARIANT, train.REFERENCE_VARIANT)
         self.assertEqual(train.REFERENCE_PROFILE, train.REFERENCE_VARIANT)
@@ -127,6 +129,12 @@ class SharedProfileTests(unittest.TestCase):
         )
         self.assertIs(
             train.model_class_for_variant(train.TRULY_VARIANT), train.TrulyPPO
+        )
+        self.assertIs(
+            train.model_class_for_variant(train.RPO_VARIANT), train.RPO
+        )
+        self.assertEqual(
+            train.algorithm_name_for_variant(train.RPO_VARIANT), "RPO"
         )
         with self.assertRaises(SystemExit):
             train.model_kwargs_for_variant("baseline")
@@ -208,6 +216,24 @@ class SharedProfileTests(unittest.TestCase):
         self.assertIn(
             "no parameter", truly["actor"]["kl_rollback"]["note"]
         )
+
+        rpo = configs[train.RPO_VARIANT]
+        self.assertEqual(rpo["profile"], train.REFERENCE_PROFILE)
+        self.assertEqual(rpo["algorithm"], "RPO")
+        self.assertEqual(
+            rpo["actor"]["objective"], "rpo_uniform_mean_perturbation"
+        )
+        self.assertTrue(rpo["actor"]["clip_range_used"])
+        self.assertIsNone(rpo["actor"]["kl_rollback"])
+        self.assertEqual(
+            rpo["actor"]["rpo"]["alpha"], train.RPO.DEFAULT_ALPHA
+        )
+        self.assertIn("training-update", rpo["actor"]["rpo"]["scope"])
+        self.assertIn("alpha=0", rpo["actor"]["rpo"]["alpha_zero"])
+        self.assertIn("cleanrl", rpo["recipe"]["rpo_source"])
+        self.assertEqual(rpo["ppo"], reference["ppo"])
+        self.assertEqual(rpo["normalization"], reference["normalization"])
+
         self.assertIn("Walker2d-v4", reference["recipe"]["environment_label"])
         self.assertIn("1903.07940", reference["recipe"]["truly_ppo_source"])
         self.assertIn("C. Wen", reference["recipe"]["truly_ppo_source"])

@@ -33,6 +33,7 @@ CONDITIONS = {
 ACTOR_OBJECTIVES = {
     "ppo-reference": "ppo_clip",
     "truly-ppo": "truly_ppo_kl_triggered_rollback",
+    "rpo": "rpo_uniform_mean_perturbation",
 }
 
 
@@ -71,7 +72,11 @@ def make_run(
         "seed": seed,
         "profile": profile,
         "environment": "Walker2d-v5",
-        "algorithm": "TrulyPPO" if variant == "truly-ppo" else "PPO",
+        "algorithm": {
+            "ppo-reference": "PPO",
+            "truly-ppo": "TrulyPPO",
+            "rpo": "RPO",
+        }.get(variant, "PPO"),
         "requested_timesteps": steps,
         "ppo": {
             "n_steps": 512,
@@ -92,12 +97,17 @@ def make_run(
     if actor == "default":
         config["actor"] = {
             "objective": ACTOR_OBJECTIVES[variant],
-            "clip_range_used": variant == "ppo-reference",
+            "clip_range_used": variant != "truly-ppo",
             "kl_rollback": (
                 {"alpha": 5.0, "delta": 0.03}
                 if variant == "truly-ppo" else None
             ),
         }
+        if variant == "rpo":
+            config["actor"]["rpo"] = {
+                "alpha": 0.5,
+                "noise": "elementwise Uniform(-alpha, alpha)",
+            }
     elif actor is not None:
         config["actor"] = actor
     if steps is not None:
@@ -139,7 +149,8 @@ def make_run(
 
 def plan(run_dir: Path, *, variant: str = "ppo-reference", seed: int = 0,
          budget: int = 1_000_000, episodes: int = 100,
-         eval_seed: int = 40_000, resume: bool = False):
+         eval_seed: int = 40_000, resume: bool = False,
+         rpo_alpha=None):
     return plan_run(
         run_dir,
         variant=variant,
@@ -148,17 +159,54 @@ def plan(run_dir: Path, *, variant: str = "ppo-reference", seed: int = 0,
         episodes=episodes,
         eval_seed=eval_seed,
         resume=resume,
+        rpo_alpha=rpo_alpha,
     )
 
 
 class PlanRunTests(unittest.TestCase):
     def test_skip_completed_run_with_matching_evaluation(self) -> None:
-        for variant in ("ppo-reference", "truly-ppo"):
+        for variant in ("ppo-reference", "truly-ppo", "rpo"):
             with tempfile.TemporaryDirectory() as directory:
                 run_dir = make_run(Path(directory), variant=variant)
                 result = plan(run_dir, variant=variant)
                 self.assertEqual(result.action, "skip", result.reason)
                 self.assertEqual(result.completed_steps, 1_000_000)
+
+    def test_rpo_config_without_alpha_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(
+                Path(directory),
+                variant="rpo",
+                actor={
+                    "objective": "rpo_uniform_mean_perturbation",
+                    "clip_range_used": True,
+                    "kl_rollback": None,
+                },
+            )
+            result = plan(run_dir, variant="rpo")
+            self.assertEqual(result.action, "error")
+            self.assertIn("rpo alpha is missing", result.reason)
+
+    def test_requested_rpo_alpha_must_match_before_skip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(Path(directory), variant="rpo")
+            matching = plan(run_dir, variant="rpo", rpo_alpha=0.5)
+            self.assertEqual(matching.action, "skip", matching.reason)
+            mismatched = plan(run_dir, variant="rpo", rpo_alpha=0.1)
+            self.assertEqual(mismatched.action, "error")
+            self.assertIn("requested RPO_ALPHA", mismatched.reason)
+
+    def test_invalid_or_non_rpo_requested_alpha_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fresh = Path(directory) / "fresh"
+            for bad in (-0.1, "abc", float("nan"), float("inf")):
+                with self.subTest(alpha=bad):
+                    result = plan(fresh, variant="rpo", rpo_alpha=bad)
+                    self.assertEqual(result.action, "error")
+                    self.assertIn("finite, non-negative", result.reason)
+            result = plan(fresh, rpo_alpha=0.1)
+            self.assertEqual(result.action, "error")
+            self.assertIn("only valid for the rpo variant", result.reason)
 
     def test_unsupported_legacy_variant_is_an_error(self) -> None:
         for variant in ("baseline", "ppo-normalized"):
@@ -399,13 +447,15 @@ class PlanRunTests(unittest.TestCase):
 
 
 class PlanCliTests(unittest.TestCase):
-    def _run_cli(self, run_dir: Path, budget: int, resume: bool = False):
+    def _run_cli(self, run_dir: Path, budget: int, resume: bool = False,
+                 variant: str = "ppo-reference",
+                 rpo_alpha: str | None = None):
         command = [
             sys.executable,
             str(PROJECT_ROOT / "scripts" / "run_matrix_lib.py"),
             "plan",
             "--run-dir", str(run_dir),
-            "--variant", "ppo-reference",
+            "--variant", variant,
             "--seed", "0",
             "--budget", str(budget),
             "--episodes", "100",
@@ -413,6 +463,8 @@ class PlanCliTests(unittest.TestCase):
         ]
         if resume:
             command.append("--resume")
+        if rpo_alpha is not None:
+            command.extend(["--rpo-alpha", rpo_alpha])
         return subprocess.run(
             command, cwd=PROJECT_ROOT, capture_output=True, text=True
         )
@@ -427,6 +479,27 @@ class PlanCliTests(unittest.TestCase):
             blocked = self._run_cli(run_dir, 1_500_000)
             self.assertEqual(blocked.returncode, 3, blocked.stderr)
             self.assertTrue(blocked.stdout.startswith("error|"), blocked.stdout)
+
+    def test_cli_rejects_a_mismatched_or_invalid_rpo_alpha(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = make_run(Path(directory), variant="rpo")
+            matched = self._run_cli(
+                run_dir, 1_000_000, variant="rpo", rpo_alpha="0.5"
+            )
+            self.assertEqual(matched.returncode, 0, matched.stderr)
+            self.assertTrue(matched.stdout.startswith("skip|"), matched.stdout)
+
+            mismatched = self._run_cli(
+                run_dir, 1_000_000, variant="rpo", rpo_alpha="0.1"
+            )
+            self.assertEqual(mismatched.returncode, 3, mismatched.stderr)
+            self.assertIn("requested RPO_ALPHA", mismatched.stdout)
+
+            invalid = self._run_cli(
+                run_dir, 1_000_000, variant="rpo", rpo_alpha="-1"
+            )
+            self.assertEqual(invalid.returncode, 3, invalid.stderr)
+            self.assertIn("finite, non-negative", invalid.stdout)
 
 
 class ShellSyntaxTests(unittest.TestCase):
@@ -582,11 +655,13 @@ class EvaluateHelpersTests(unittest.TestCase):
                     "seed": 7,
                     "requested_timesteps": 1_000_000,
                     "actual_timesteps": 1_000_000,
+                    "actor": {"objective": "ppo_clip"},
                 },
             )
             metadata = training_metadata(model, "ppo-reference")
             self.assertEqual(metadata["seed"], 7)
             self.assertEqual(metadata["actual_timesteps"], 1_000_000)
+            self.assertEqual(metadata["actor_objective"], "ppo_clip")
             self.assertTrue(str(metadata["config"]).endswith("config.json"))
 
     def test_training_metadata_ignores_variant_mismatch(self) -> None:
@@ -598,6 +673,7 @@ class EvaluateHelpersTests(unittest.TestCase):
             metadata = training_metadata(model, "ppo-reference")
             self.assertIsNone(metadata["seed"])
             self.assertIsNone(metadata["config"])
+            self.assertIsNone(metadata["actor_objective"])
 
     def test_training_metadata_reads_best_parent_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

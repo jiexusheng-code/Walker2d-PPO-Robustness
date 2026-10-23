@@ -16,6 +16,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from envs import make_env
+from rpo_ppo import RPO
 from truly_ppo import TrulyPPO
 
 
@@ -24,7 +25,7 @@ CONDITIONS = {
     "heldout_low": (0.7, 0.7),
     "heldout_high": (1.3, 1.3),
 }
-TRAINING_VARIANTS = ("ppo-reference", "truly-ppo")
+TRAINING_VARIANTS = ("ppo-reference", "truly-ppo", "rpo")
 LEGACY_EVAL_VARIANTS = ("baseline",)
 VARIANTS = TRAINING_VARIANTS + LEGACY_EVAL_VARIANTS
 EVALUATOR_SCHEMA_VERSION = 3
@@ -97,17 +98,22 @@ def training_metadata(model_path: Path, variant: str) -> dict[str, object]:
             continue
         if config.get("variant") not in (None, variant):
             continue
+        actor = config.get("actor")
         return {
             "config": str(config_path),
             "seed": config.get("seed"),
             "requested_timesteps": config.get("requested_timesteps"),
             "actual_timesteps": config.get("actual_timesteps"),
+            "actor_objective": (
+                actor.get("objective") if isinstance(actor, dict) else None
+            ),
         }
     return {
         "config": None,
         "seed": None,
         "requested_timesteps": None,
         "actual_timesteps": None,
+        "actor_objective": None,
     }
 
 
@@ -147,9 +153,10 @@ def summarize_condition(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a Walker2d PPO model deterministically. The two current "
-            "arms are ppo-reference and truly-ppo; baseline is accepted only "
-            "for offline evaluation of historical unnormalized models."
+            "Evaluate a Walker2d PPO model deterministically. The current "
+            "variants are ppo-reference, truly-ppo, and rpo; baseline is "
+            "accepted only for offline evaluation of historical unnormalized "
+            "models."
         )
     )
     parser.add_argument("--model", type=Path, required=True)
@@ -163,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--vecnormalize", type=Path,
-        help="VecNormalize statistics for the two current arms "
+        help="VecNormalize statistics for the current training variants "
              "(default: the statistics file belonging to --model).",
     )
     parser.add_argument(
@@ -198,7 +205,12 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(1)
-    model_class = TrulyPPO if args.variant == "truly-ppo" else PPO
+    if args.variant == "truly-ppo":
+        model_class = TrulyPPO
+    elif args.variant == "rpo":
+        model_class = RPO
+    else:
+        model_class = PPO
     model = model_class.load(args.model, device="cpu")
     rows: list[dict[str, object]] = []
     summary: dict[str, dict[str, object]] = {}
@@ -291,6 +303,10 @@ def main() -> None:
     report = {
         "model": str(args.model),
         "variant": args.variant,
+        "actor_objective": training["actor_objective"],
+        "rpo_alpha": (
+            float(model.rpo_alpha) if args.variant == "rpo" else None
+        ),
         "normalization": {
             "enabled": normalized,
             "vecnormalize": (

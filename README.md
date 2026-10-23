@@ -1,11 +1,12 @@
 # Walker2d PPO Robustness
 
-A reproducible two-arm comparison on Gymnasium's `Walker2d-v5`:
+A reproducible shared-profile comparison of actor-objective variants on Gymnasium's `Walker2d-v5`:
 
 - **`ppo-reference`**: Stable-Baselines3 PPO with the standard PPO-Clip actor objective.
 - **`truly-ppo`**: the same shared reference recipe with only the actor objective replaced by Truly PPO's KL-triggered rollback.
+- **`rpo`**: the same shared reference recipe with only the update-time policy mean perturbed by RPO noise. It is not part of the default matrix; select it explicitly.
 
-Both arms use the same environment, observation/reward normalization, network, learning rate and schedule, rollout settings, value/entropy coefficients, seed, evaluation protocol, and step budget. The comparison is empirical; it does not assume either arm will win. Report every seed and every condition, including neutral or negative results.
+All variants use the same environment, observation/reward normalization, network, learning rate and schedule, rollout settings, value/entropy coefficients, seed, evaluation protocol, and step budget. The comparison is empirical; it does not assume any variant will win. Report every seed and every condition, including neutral or negative results.
 
 ## Shared recipe and the only planned difference
 
@@ -17,7 +18,7 @@ Both arms use the same environment, observation/reward normalization, network, l
 | Learning rate | constant `5.05041e-5` |
 | Rollout / update | `n_steps=512`, `batch_size=32`, `n_epochs=20` |
 | Discount / GAE | `gamma=0.99`, `gae_lambda=0.95` |
-| PPO clip | `clip_range=0.1` (used only by the standard PPO actor) |
+| PPO clip | `clip_range=0.1` (used by the standard PPO and RPO actors) |
 | Entropy / value | `ent_coef=0.000585045`, `vf_coef=0.871923` |
 | Gradient clipping | `max_grad_norm=1.0` |
 | Environments | `n_envs=1`, seed controlled per run |
@@ -31,7 +32,9 @@ The only planned actor difference is:
 
 The rollback is a paper port, not a guarantee of higher return, sample efficiency, or robustness to perturbed dynamics. Held-out conditions change friction and actuator strength together, so they measure joint dynamics robustness rather than isolating either parameter. The trigger condition follows the authors' reference implementation: [wangyuhuix/TrulyPPO](https://github.com/wangyuhuix/TrulyPPO).
 
-## Cloud run: both arms
+- `rpo`: Robust Policy Optimization's update-time perturbation, following [CleanRL's `rpo_continuous_action.py`](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/rpo_continuous_action.py). Rollout collection samples from the plain Gaussian, and deterministic prediction returns its mean. Only the log-probability used by the PPO update evaluates the original rollout actions under a Gaussian whose mean is shifted by elementwise `Uniform(-alpha, alpha)` noise; entropy and the saved old log-probability remain unperturbed. The default is `alpha=0.5`; any finite non-negative value is accepted. `alpha=0` skips the noise draw entirely and is exactly PPO-Clip. This is an SB3 policy-level port, not a bit-exact reproduction of the paper's training setup, and it guarantees no performance gain.
+
+## Cloud run: default arms
 
 Requirements: Python 3.11 or 3.12, `uv`, and a CPU-only Linux instance. This project is developed with uv 0.10.10; use that version or a compatible newer one.
 
@@ -41,12 +44,19 @@ uv sync --locked
 bash scripts/run_matrix.sh
 ```
 
-Defaults: both arms, seed 0, 1,000,000 steps per arm, periodic evaluation every 50,000 steps (10 episodes, periodic RNG seed 50,000), then the final deterministic evaluation over `nominal`, `heldout_low`, and `heldout_high` with 100 episodes per condition and per-episode seeds `40000 + i`. Runs are sequential. The matrix writes to the new root `runs/two_arm/<variant>/seed_<seed>/`; the retired three-group history under `runs/main/` is left untouched. The startup line and each run's `config.json` prominently record the variant and `shared_profile=ppo-reference`.
+Defaults: the two default arms (`ppo-reference` and `truly-ppo`), seed 0, 1,000,000 steps per arm, periodic evaluation every 50,000 steps (10 episodes, periodic RNG seed 50,000), then the final deterministic evaluation over `nominal`, `heldout_low`, and `heldout_high` with 100 episodes per condition and per-episode seeds `40000 + i`. Runs are sequential. The matrix writes to the new root `runs/two_arm/<variant>/seed_<seed>/`; the retired three-group history under `runs/main/` is left untouched. The startup line and each run's `config.json` prominently record the variant and `shared_profile=ppo-reference`.
 
 Review seed 0 before paying for more seeds, then expand explicitly:
 
 ```bash
 SEEDS="0 1 2" bash scripts/run_matrix.sh
+```
+
+To train the experimental RPO variant explicitly (it is never added to the default matrix), request it by name:
+
+```bash
+VARIANTS="rpo" SEEDS="0" bash scripts/run_matrix.sh
+# Optional: RPO_ALPHA=0.5 (default) sets the uniform-noise half-width.
 ```
 
 To survive an SSH disconnect, run it inside `tmux`:
@@ -61,9 +71,9 @@ bash scripts/run_matrix.sh 2>&1 | tee runs/matrix.log
 
 Other entry points:
 
-- `bash scripts/pilot_reference.sh` trains **only** `ppo-reference` and writes a timestamped directory under `runs/reference_pilot/`. It is a single-arm pilot; use `run_matrix.sh` for the two-arm comparison.
-- `bash scripts/cloud_smoke.sh` runs the unit tests, trains both arms for 4,096 steps, and evaluates them briefly under a timestamped `runs/smoke/` directory.
-- `bash scripts/benchmark.sh` trains both arms for 50,000 steps and writes timestamped throughput measurements under `runs/benchmark/`.
+- `bash scripts/pilot_reference.sh` trains **only** `ppo-reference` and writes a timestamped directory under `runs/reference_pilot/`. It is a single-arm pilot; use `run_matrix.sh` for the shared-profile comparison.
+- `bash scripts/cloud_smoke.sh` runs the unit tests, trains the two default arms for 4,096 steps, and evaluates them briefly under a timestamped `runs/smoke/` directory.
+- `bash scripts/benchmark.sh` trains the two default arms for 50,000 steps and writes timestamped throughput measurements under `runs/benchmark/`.
 
 All scripts use `uv sync --locked` and do not modify dependencies or the lockfile. They run sequentially; there is no scheduler or concurrency layer.
 
@@ -76,7 +86,7 @@ Each run directory contains:
 - `checkpoints/`, `best/best_model.zip`, `best/vecnormalize.pkl`, `tensorboard/`, `monitor.csv`, `metrics.jsonl`, and `evaluations.npz`: diagnostics and resume material.
 - `evaluation/episodes.csv` and `evaluation/summary.json`: final deterministic per-episode and per-condition results.
 
-The **final model** is the primary result. The final evaluator loads matching VecNormalize statistics, keeps them frozen (`training=False`, `norm_reward=False`), evaluates raw environment return, and uses the same base seed protocol (`base_seed + episode`) for both arms. `summary.json` records the model and statistics SHA-256 hashes, variant, condition set, episode count, base seed, and determinism flag.
+The **final model** is the primary result. The final evaluator loads matching VecNormalize statistics, keeps them frozen (`training=False`, `norm_reward=False`), evaluates raw environment return, and uses the same base seed protocol (`base_seed + episode`) for every arm. `summary.json` records the model and statistics SHA-256 hashes, variant, actor objective, RPO alpha (for `rpo`), condition set, episode count, base seed, and determinism flag.
 
 `best/best_model.zip` is **diagnostic only**. It is selected by periodic evaluation with periodic RNG seed 50,000, which is a different episode stream from the final evaluation. Never substitute it for the final-model result.
 
@@ -97,13 +107,13 @@ uv run python train.py --variant truly-ppo --seed 0 --timesteps 1000000 \
   --run-dir runs/two_arm/truly-ppo/seed_0 --resume
 ```
 
-`--resume` without a value picks `final_model.zip`, otherwise the latest checkpoint, together with the matching statistics. It never silently starts a new run when there is nothing to resume. Resume validates the configuration before training: variant, seed, shared profile (`ppo-reference`), all shared PPO settings, normalization, and the actor objective (including `alpha`/`delta` for Truly PPO). Legacy `baseline`, `ppo-normalized`, and old 2048-step `truly-ppo` bases are rejected with a clear error instead of being resumed into the new profile. `--timesteps` remains the absolute budget; a resumed run trains only the remaining steps.
+`--resume` without a value picks `final_model.zip`, otherwise the latest checkpoint, together with the matching statistics. It never silently starts a new run when there is nothing to resume. Resume validates the configuration before training: variant, seed, shared profile (`ppo-reference`), all shared PPO settings, normalization, and the actor objective (including `alpha`/`delta` for Truly PPO and `--rpo-alpha` for RPO). For RPO, omitting `--rpo-alpha` resumes the alpha stored in the checkpoint; passing a different value is rejected. Loading a non-RPO checkpoint as the `rpo` variant is also rejected. Legacy `baseline`, `ppo-normalized`, and old 2048-step `truly-ppo` bases are rejected with a clear error instead of being resumed into the new profile. `--timesteps` remains the absolute budget; a resumed run trains only the remaining steps.
 
 Limits: the rollout buffer and environment RNG stream are not checkpointed, so a resumed run is a close continuation, not a bit-exact one. With `n_steps=512`, at most the rollout in flight is discarded.
 
 ## Legacy historical models
 
-The old three-arm training plan (`baseline`, `ppo-normalized`, `truly-ppo` on the old recipe) is retired. `train.py` accepts only `ppo-reference` and `truly-ppo`. Existing historical runs and models are left untouched. A historical unnormalized baseline model can still be evaluated offline:
+The old three-arm training plan (`baseline`, `ppo-normalized`, `truly-ppo` on the old recipe) is retired. `train.py` accepts only `ppo-reference`, `truly-ppo`, and the experimental `rpo` variant. Existing historical runs and models are left untouched. A historical unnormalized baseline model can still be evaluated offline:
 
 ```bash
 uv run python evaluate.py \
@@ -113,7 +123,7 @@ uv run python evaluate.py \
   --output-dir runs/pilot/baseline/seed_0/evaluation
 ```
 
-This is evaluation-only compatibility, not a third training group. Do not mix those results with the new shared-profile two-arm comparison.
+This is evaluation-only compatibility, not a third training group. Do not mix those results with the new shared-profile comparison.
 
 ## Training diagnostics
 
@@ -124,10 +134,12 @@ Keep the whole run directory. `metrics.jsonl`, `monitor.csv`, `evaluations.npz`,
 - Rollout episodes: raw episode return, length, and healthy-timeout rate.
 - Normalization: action/observation clipping fractions and observation RMS scale.
 
+For `rpo`, `train/approx_kl` and `train/clip_fraction` are computed against the saved unperturbed rollout log-probability using the perturbed update log-probability. They therefore include the perturbation itself and can be nonzero before any parameter update. They are not an analytic KL between the unperturbed policies.
+
 These are correlational. A spike or collapse is a reason to inspect a run, not proof of a cause. View TensorBoard through an SSH tunnel (`uv run tensorboard --logdir runs/two_arm --host 127.0.0.1 --port 6006`); do not expose port 6006 publicly.
 
 Before deleting a cloud instance, archive the entire run directory: `console.log` (when present), `config.json`, models, statistics, checkpoints, `best/`, TensorBoard events, Monitor/metrics files, and both `evaluation/` and `best/evaluation/`. `runs/` is git-ignored.
 
 ## Interpretation
 
-Use nominal mean return from `final_model` as the primary outcome per seed. Report the paired per-seed difference `truly-ppo - ppo-reference` and both held-out conditions separately. Three seeds is a small sample: it cannot support significance claims, and one divergent seed dominates the mean and standard deviation. Prefer per-seed values and paired differences over a pooled aggregate. Any ranking is preliminary, and the Truly PPO rollback is not expected to guarantee a gain.
+Use nominal mean return from `final_model` as the primary outcome per seed. Report the paired per-seed difference `variant - ppo-reference` (for example `truly-ppo - ppo-reference`, or `rpo - ppo-reference` if you ran RPO) and both held-out conditions separately. Three seeds is a small sample: it cannot support significance claims, and one divergent seed dominates the mean and standard deviation. Prefer per-seed values and paired differences over a pooled aggregate. Any ranking is preliminary, and neither the Truly PPO rollback nor the RPO perturbation is expected to guarantee a gain.

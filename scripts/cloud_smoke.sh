@@ -15,7 +15,7 @@ if [ -z "$VARIANTS" ]; then
 fi
 for variant in $VARIANTS; do
   case "$variant" in
-    ppo-reference|truly-ppo) ;;
+    ppo-reference|truly-ppo|rpo) ;;
     *)
       printf 'error: unsupported training variant: %s\n' "$variant" >&2
       exit 1
