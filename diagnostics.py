@@ -285,11 +285,14 @@ class HealthyEvalCallback(EvalCallback):
         *args: Any,
         eval_seed: int,
         metrics_writer: JsonlMetricsWriter | None = None,
+        debug_directory: Path | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.eval_seed = eval_seed
         self.metrics_writer = metrics_writer
+        self.debug_directory = debug_directory
+        self._eval_debug = None
         self._healthy_timeouts = 0
         self._unhealthy_terminations = 0
 
@@ -299,6 +302,21 @@ class HealthyEvalCallback(EvalCallback):
         super()._log_success_callback(locals_, globals_)
         if not locals_.get("done"):
             return
+        if self._eval_debug is not None:
+            info = locals_["info"]
+            self._eval_debug.write(json.dumps(jsonable({
+                "event": "episode",
+                "step": int(self.num_timesteps),
+                "evaluation_index": len(self.evaluations_timesteps),
+                "episode_index": int(np.asarray(locals_["episode_counts"])[locals_["i"]]),
+                "stream_seed": self.eval_seed,
+                "seed_protocol": "stream seeded once per evaluation, not seed+i",
+                "episode": info.get("episode"),
+                "end": classify_episode_end(info),
+                "info": {k: v for k, v in info.items()
+                         if k not in ("episode", "terminal_observation")},
+            })) + "\n")
+            self._eval_debug.flush()
         if classify_episode_end(locals_["info"]) == "healthy_timeout":
             self._healthy_timeouts += 1
         else:
@@ -310,9 +328,29 @@ class HealthyEvalCallback(EvalCallback):
         )
         if will_evaluate:
             self.eval_env.seed(self.eval_seed)
+            if self.debug_directory is not None:
+                directory = self.debug_directory / f"eval_{self.num_timesteps:012d}"
+                directory.mkdir(parents=True, exist_ok=False)
+                self.model.save(directory / "model.zip")
+                self.model.get_vec_normalize_env().save(directory / "vecnormalize.pkl")
+                self._eval_debug = (directory / "episodes.jsonl").open("x", encoding="utf-8")
+                self._eval_debug.write(json.dumps({
+                    "event": "evaluation_start",
+                    "step": int(self.num_timesteps),
+                    "n_updates": int(self.model._n_updates),
+                    "stream_seed": self.eval_seed,
+                    "phase": "during rollout, before the following optimizer update",
+                    "deterministic": bool(self.deterministic),
+                }) + "\n")
+                self._eval_debug.flush()
 
         previous_evaluations = len(self.evaluations_timesteps)
-        continue_training = super()._on_step()
+        try:
+            continue_training = super()._on_step()
+        finally:
+            if self._eval_debug is not None:
+                self._eval_debug.close()
+                self._eval_debug = None
 
         if len(self.evaluations_timesteps) > previous_evaluations:
             completed = self._healthy_timeouts + self._unhealthy_terminations

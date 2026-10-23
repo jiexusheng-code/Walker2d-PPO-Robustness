@@ -109,7 +109,7 @@ uv run python train.py --variant truly-ppo --seed 0 --timesteps 1000000 \
 
 `--resume` without a value picks `final_model.zip`, otherwise the latest checkpoint, together with the matching statistics. It never silently starts a new run when there is nothing to resume. Resume validates the configuration before training: variant, seed, shared profile (`ppo-reference`), all shared PPO settings, normalization, and the actor objective (including `alpha`/`delta` for Truly PPO and `--rpo-alpha` for RPO). For RPO, omitting `--rpo-alpha` resumes the alpha stored in the checkpoint; passing a different value is rejected. Loading a non-RPO checkpoint as the `rpo` variant is also rejected. Legacy `baseline`, `ppo-normalized`, and old 2048-step `truly-ppo` bases are rejected with a clear error instead of being resumed into the new profile. `--timesteps` remains the absolute budget; a resumed run trains only the remaining steps.
 
-Limits: the rollout buffer and environment RNG stream are not checkpointed, so a resumed run is a close continuation, not a bit-exact one. With `n_steps=512`, at most the rollout in flight is discarded.
+Limits: ordinary `--resume` does not restore simulator state or its RNG stream, so it is a close continuation, not a bit-exact one. RPO's debug packages additionally save complete pre-update rollout buffers and optimizer/RNG state for **fixed-buffer update replay**; these are not simulator-continuation checkpoints. With `n_steps=512`, an interrupted rollout in flight may still be lost.
 
 ## Legacy historical models
 
@@ -139,6 +139,28 @@ For `rpo`, `train/approx_kl` and `train/clip_fraction` are computed against the 
 These are correlational. A spike or collapse is a reason to inspect a run, not proof of a cause. View TensorBoard through an SSH tunnel (`uv run tensorboard --logdir runs/two_arm --host 127.0.0.1 --port 6006`); do not expose port 6006 publicly.
 
 Before deleting a cloud instance, archive the entire run directory: `console.log` (when present), `config.json`, models, statistics, checkpoints, `best/`, TensorBoard events, Monitor/metrics files, and both `evaluation/` and `best/evaluation/`. `runs/` is git-ignored.
+
+## RPO replayable flight recorder
+
+RPO training through `train.py` automatically records **every rollout-level training update** under `debug/updates/` (one package per 512 environment steps with the shared recipe); it is not limited to periodic checkpoints. Each package covers all 20 epochs / 320 minibatch optimizer steps, with one measurement row per minibatch. It keeps pre/post models (including Adam), the full pre-update rollout buffer, Python/NumPy/Torch RNG state, matching VecNormalize statistics, full-buffer unperturbed distribution probes, update-aligned diagnostics and actual minibatch measurements. Manifests record hashes, status and partial failures. Recording failures stop training rather than silently leave missing evidence. No automatic retention/deletion policy is applied.
+
+`debug/transitions/` stores compressed per-rollout traces: raw and normalized observations, raw Gaussian and clipped environment actions, old values/log-probabilities, raw and normalized rewards, episode boundaries, terminal observations, reward components and MuJoCo qpos/qvel. The normalized reward here precedes SB3's timeout bootstrap; the saved update buffer contains actual training rewards and GAE targets. Done-step next observations/qpos/qvel follow DummyVecEnv auto-reset and are explicitly labelled; terminal observation is separate, and its inverse-normalized reconstruction can lose information if VecNormalize clipped it. Environment XML, dynamics arrays and installed package versions are saved at each training segment start.
+
+`debug/evaluations/` keeps the exact model/statistics pair and per-episode records at every periodic evaluation, not just the best. Periodic evaluation is during rollout, before the following optimizer update; records include `_n_updates` to disambiguate timing and use the existing fixed evaluation RNG stream (not `seed+i`).
+
+After training, verify an update **on the same software/platform and CPU thread configuration**:
+
+```bash
+uv run python scripts/replay_rpo_update.py \
+  runs/rpo_screening/rpo/seed_0/debug/updates/update_000000 \
+  --trust-local --output runs/replay_update_000000.json
+```
+
+Only use `--trust-local` for your own training packages: model/buffer/RNG files contain executable pickle data. The verifier checks file hashes first and requires exact policy and Adam state equality after replay. It refuses to overwrite its output. A hash is an integrity check, not authentication of an untrusted package.
+
+If performance deteriorates, preserve the whole run: locate the first degraded periodic evaluation, identify its preceding recorded updates, replay those exact buffers, then compare unperturbed KL/ratios, perturbed ratios, advantage signs, value fit, component gradients, gradient clipping and actual parameter steps. Test one proposed mechanism at a time on the saved data before proposing another long run. A fixed-buffer counterfactual diagnoses a local update; complete training-seed confirmation still requires actual experiments.
+
+This recorder costs disk and runtime. A local CPU smoke using the full 512-step / 20-epoch recipe wrote 320 minibatch records, about **1.86 MB per update package**, plus about **0.32 MB per rollout trace** and **0.07 MB per periodic evaluation snapshot**. Multiplying by `ceil(1_000_000 / 512) = 1954` gives roughly **4.3 GB of debug data per million-step run** before normal checkpoints, TensorBoard, and other run artifacts. These are planning estimates, not size caps; reserve headroom. A separate local timing over two full-recipe updates (1,024 steps, including traces but excluding periodic evaluation) took 3.09 s without recording and 7.24 s with recording, about **2.35× runtime**. This single-machine smoke measurement is not a cloud throughput forecast. Summary quantiles describe the distribution of the recorded minibatch statistics, not pooled per-transition quantiles. Component-gradient probes run on the first minibatch of each epoch, not every minibatch. Do not delete old packages without explicit approval. `runs/` remains git-ignored and must be archived separately before deleting the server.
 
 ## Interpretation
 

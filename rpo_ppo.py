@@ -145,9 +145,17 @@ class RPO(PPO):
                 "RPO supports only the diagonal Gaussian policy distribution"
             )
 
+    def _excluded_save_params(self) -> list[str]:
+        # A runtime flight recorder must never be pickled into model.zip.
+        return [*super()._excluded_save_params(), "_update_recorder"]
+
     def train(self) -> None:
         # PPO's training loop is intentionally inherited; the only change is
         # that its evaluate_actions call uses the perturbed mean.
         self._validate_supported()
-        super().train()
+        recorder = getattr(self, "_update_recorder", None)
+        if recorder is None:
+            super().train()
+        else:
+            recorder.run_update(self, super().train)
         self.logger.record("train/rpo_alpha", float(self.rpo_alpha))

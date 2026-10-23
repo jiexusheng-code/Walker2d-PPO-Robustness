@@ -31,6 +31,8 @@ from diagnostics import (
 from envs import make_env
 from rpo_ppo import DEFAULT_RPO_ALPHA, RPO, RPO_SOURCE_URL, validate_rpo_alpha
 from truly_ppo import TrulyPPO
+from training_trace import TrainingTraceCallback
+from update_recording import UpdateRecorder
 
 
 REFERENCE_VARIANT = "ppo-reference"
@@ -246,6 +248,8 @@ def existing_run_artifacts(run_dir: Path) -> list[Path]:
         run_dir / name for name in RUN_ARTIFACTS
         if (run_dir / name).exists()
     ]
+    if (run_dir / "debug").is_dir() and any((run_dir / "debug").iterdir()):
+        found.append(run_dir / "debug")
     for name in ("checkpoints", "best", "tensorboard", "evaluation"):
         directory = run_dir / name
         if directory.is_dir() and any(directory.iterdir()):
@@ -523,6 +527,17 @@ def build_run_config(
         "resume_history": resume_history,
         "segments": segments,
         "status": "running",
+        "debug_recording": {
+            "enabled": variant == RPO_VARIANT,
+            "schema_version": 1,
+            "update_packages": "debug/updates",
+            "transition_traces": "debug/transitions",
+            "retention": "all updates; no automatic deletion",
+            "scope": (
+                "Fixed-buffer optimizer-update replay, not exact simulator "
+                "continuation. Per-step traces label autoreset states."
+            ),
+        },
         "last_observed_timesteps": start_timesteps,
         "error_type": None,
         "actual_timesteps": None,
@@ -898,6 +913,8 @@ def main() -> None:
                 repo_root / "envs.py",
                 repo_root / "truly_ppo.py",
                 repo_root / "rpo_ppo.py",
+                repo_root / "update_recording.py",
+                repo_root / "training_trace.py",
             ]),
         )
         write_config(config_path, state)
@@ -914,6 +931,8 @@ def main() -> None:
         )
         logger.output_formats.append(metrics_writer)
         model.set_logger(logger)
+        if args.variant == RPO_VARIANT:
+            model._update_recorder = UpdateRecorder(run_dir / "debug" / "updates")
 
         callbacks = [
             ConfigCheckpointCallback(
@@ -925,7 +944,8 @@ def main() -> None:
                 save_replay_buffer=False,
                 save_vecnormalize=True,
             ),
-            TrainingMetricsCallback(),
+            (TrainingTraceCallback(run_dir / "debug" / "transitions")
+             if args.variant == RPO_VARIANT else TrainingMetricsCallback()),
         ]
         if start_timesteps > 0:
             # Keep checkpoint filenames on absolute step multiples after resume.
@@ -946,6 +966,10 @@ def main() -> None:
                 verbose=1,
                 eval_seed=args.eval_seed,
                 metrics_writer=metrics_writer,
+                debug_directory=(
+                    run_dir / "debug" / "evaluations"
+                    if args.variant == RPO_VARIANT else None
+                ),
             )
             if resumed_from is not None:
                 if restore_eval_history(eval_callback, run_dir):
