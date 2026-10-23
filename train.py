@@ -6,7 +6,6 @@ import math
 import re
 import time
 from pathlib import Path
-from typing import Callable
 
 import gymnasium
 import mujoco
@@ -34,27 +33,24 @@ from truly_ppo import TrulyPPO
 
 
 REFERENCE_VARIANT = "ppo-reference"
-VARIANTS = ("baseline", "ppo-normalized", "truly-ppo", REFERENCE_VARIANT)
+TRULY_VARIANT = "truly-ppo"
+VARIANTS = (REFERENCE_VARIANT, TRULY_VARIANT)
+DEFAULT_VARIANT = REFERENCE_VARIANT
+REFERENCE_PROFILE = REFERENCE_VARIANT
+ACTOR_OBJECTIVES = {
+    REFERENCE_VARIANT: "ppo_clip",
+    TRULY_VARIANT: "truly_ppo_kl_triggered_rollback",
+}
 CHECKPOINT_PREFIX = "ppo_walker2d"
 CHECKPOINT_PATTERN = re.compile(r"^(?P<prefix>.+)_(?P<steps>\d+)_steps\.zip$")
-TOTAL_PPO_KWARGS = {
-    "n_steps": 2048,
-    "batch_size": 64,
-    "n_epochs": 10,
-    "gamma": 0.99,
-    "gae_lambda": 0.95,
-    "clip_range": 0.2,
-    "ent_coef": 0.0,
-    "vf_coef": 0.5,
-    "max_grad_norm": 0.5,
-    "policy_kwargs": {"net_arch": {"pi": [64, 64], "vf": [64, 64]}},
-    "device": "cpu",
-}
-INITIAL_LEARNING_RATE = 3e-4
 
 REFERENCE_LEARNING_RATE = 5.05041e-5
 REFERENCE_SOURCE_URL = (
     "https://github.com/DLR-RM/rl-baselines3-zoo/blob/master/hyperparams/ppo.yml"
+)
+TRULY_PPO_SOURCE = (
+    "Y. Wang, H. He, C. Wen, X. Tan, Truly Proximal Policy Optimization "
+    "(arXiv:1903.07940, 2019; extended 2020 version)"
 )
 REFERENCE_PPO_KWARGS = {
     "n_steps": 512,
@@ -77,7 +73,7 @@ POLICY_DEFAULTS = {
     "use_sde": False,
     "squash_output": False,
 }
-REFERENCE_ARTIFACTS = (
+RUN_ARTIFACTS = (
     "final_model.zip",
     "vecnormalize.pkl",
     "config.json",
@@ -87,26 +83,27 @@ REFERENCE_ARTIFACTS = (
 )
 
 
-def linear_schedule(initial_value: float) -> Callable[[float], float]:
-    return lambda progress_remaining: progress_remaining * initial_value
+def _require_supported_variant(variant: str) -> None:
+    if variant not in VARIANTS:
+        raise SystemExit(
+            f"error: unsupported variant {variant!r}; train.py only trains "
+            f"{', '.join(VARIANTS)}"
+        )
 
 
 def make_training_env(
-    normalize: bool,
     stats_path: Path | None = None,
     *,
     monitor_path: Path | None = None,
     monitor_append: bool = False,
 ):
+    """Create the single normalized training environment used by both arms."""
     monitor_kwargs = {}
     if monitor_path is not None:
         monitor_kwargs = {
             "filename": str(monitor_path),
             "override_existing": not monitor_append,
         }
-    if not normalize:
-        return Monitor(make_env(), **monitor_kwargs)
-
     vector_env = DummyVecEnv([lambda: Monitor(make_env(), **monitor_kwargs)])
     if stats_path is not None:
         env = VecNormalize.load(str(stats_path), vector_env)
@@ -120,14 +117,12 @@ def make_training_env(
         norm_reward=True,
         clip_obs=10.0,
         clip_reward=10.0,
-        gamma=TOTAL_PPO_KWARGS["gamma"],
+        gamma=REFERENCE_PPO_KWARGS["gamma"],
     )
 
 
-def make_eval_env(normalize: bool):
+def make_eval_env():
     """Independent nominal environment used only for periodic evaluation."""
-    if not normalize:
-        return Monitor(make_env())
     vector_env = DummyVecEnv([lambda: Monitor(make_env())])
     env = VecNormalize(
         vector_env,
@@ -135,58 +130,91 @@ def make_eval_env(normalize: bool):
         norm_reward=True,
         clip_obs=10.0,
         clip_reward=10.0,
-        gamma=TOTAL_PPO_KWARGS["gamma"],
+        gamma=REFERENCE_PPO_KWARGS["gamma"],
     )
     env.training = False
     env.norm_reward = False
     return env
 
 
-def normalized_for_variant(variant: str) -> bool:
-    return variant != "baseline"
+def model_class_for_variant(variant: str):
+    _require_supported_variant(variant)
+    return TrulyPPO if variant == TRULY_VARIANT else PPO
 
 
 def model_kwargs_for_variant(variant: str) -> dict:
-    if variant == REFERENCE_VARIANT:
-        return REFERENCE_PPO_KWARGS
-    return TOTAL_PPO_KWARGS
+    _require_supported_variant(variant)
+    return REFERENCE_PPO_KWARGS
 
 
-def learning_rate_for_variant(variant: str):
-    if variant == REFERENCE_VARIANT:
-        return REFERENCE_LEARNING_RATE
-    if normalized_for_variant(variant):
-        return linear_schedule(INITIAL_LEARNING_RATE)
-    return INITIAL_LEARNING_RATE
+def learning_rate_for_variant(variant: str) -> float:
+    _require_supported_variant(variant)
+    return REFERENCE_LEARNING_RATE
+
+
+def actor_config_for_variant(variant: str) -> dict:
+    _require_supported_variant(variant)
+    if variant == TRULY_VARIANT:
+        return {
+            "objective": ACTOR_OBJECTIVES[variant],
+            "clip_range_used": False,
+            "kl_rollback": {
+                "alpha": TrulyPPO.truly_alpha,
+                "delta": TrulyPPO.truly_delta,
+                "trigger": (
+                    "kl(old||new) >= delta and "
+                    "(ratio - 1) * advantage > 0"
+                ),
+                "penalty": "ratio * advantage - alpha * kl(old||new)",
+                "note": (
+                    "KL penalty inside the actor objective; no parameter or "
+                    "optimizer state is restored."
+                ),
+            },
+        }
+    return {
+        "objective": ACTOR_OBJECTIVES[variant],
+        "clip_range_used": True,
+        "kl_rollback": None,
+    }
 
 
 def default_run_dir(variant: str, seed: int) -> Path:
+    _require_supported_variant(variant)
     return Path("runs") / variant / f"seed_{seed}"
 
 
-def reference_existing_artifacts(run_dir: Path) -> list[Path]:
+def existing_run_artifacts(run_dir: Path) -> list[Path]:
     found = [
-        run_dir / name for name in REFERENCE_ARTIFACTS
+        run_dir / name for name in RUN_ARTIFACTS
         if (run_dir / name).exists()
     ]
-    for name in ("checkpoints", "best", "tensorboard"):
+    for name in ("checkpoints", "best", "tensorboard", "evaluation"):
         directory = run_dir / name
         if directory.is_dir() and any(directory.iterdir()):
             found.append(directory)
     return found
 
 
-def ensure_reference_run_dir_available(
-    run_dir: Path, resume: str | None
+def ensure_run_dir_available(
+    run_dir: Path, *, allow_existing_from: Path | None = None
 ) -> None:
-    if resume is not None:
-        return
-    existing = reference_existing_artifacts(run_dir)
+    """Refuse to write into a directory that already holds another run.
+
+    A resume source inside ``run_dir`` is expected to leave artifacts behind.
+    An external resume source is allowed only when ``run_dir`` itself is new.
+    """
+    if allow_existing_from is not None:
+        source = Path(allow_existing_from).resolve()
+        if source.is_relative_to(run_dir.resolve()):
+            return
+    existing = existing_run_artifacts(run_dir)
     if existing:
         listed = ", ".join(str(path) for path in existing)
         raise SystemExit(
-            f"error: refusing to overwrite existing reference artifacts in "
-            f"{run_dir}: {listed}. Use --resume or a different --run-dir."
+            f"error: refusing to overwrite existing run artifacts in "
+            f"{run_dir}: {listed}. Use --resume pointing into this directory "
+            f"or a different --run-dir."
         )
 
 
@@ -213,116 +241,167 @@ def _schedule_value(value) -> float:
 
 
 def validate_resume(
-    run_dir: Path, args: argparse.Namespace, model, *, normalized: bool
+    run_dir: Path, args: argparse.Namespace, model
 ) -> None:
     """Reject a model whose saved configuration does not match this run.
 
-    The reference profile is strict: its config must exist and the loaded
-    model's actual PPO hyperparameters must match. Older variants keep the
-    previous resume behavior (variant/seed are checked only when present).
+    Both arms use the same strict reference profile. The only permitted
+    difference is the recorded actor objective. This also rejects a legacy
+    ``truly-ppo`` run that used the old 2048-step recipe, rather than silently
+    resuming it into the new shared profile.
     """
     config_path = run_dir / "config.json"
     if not config_path.exists():
-        if args.variant == REFERENCE_VARIANT:
-            raise SystemExit(
-                f"error: cannot resume {REFERENCE_VARIANT} without "
-                f"{config_path}"
-            )
-        return
-    config = _load_config(config_path)
-    mismatches: list[str] = []
-
-    if args.variant == REFERENCE_VARIANT:
-        if config.get("variant") != args.variant:
-            mismatches.append(
-                f"variant {config.get('variant')!r} != {args.variant!r}"
-            )
-        if config.get("seed") != args.seed:
-            mismatches.append(
-                f"seed {config.get('seed')!r} != {args.seed!r}"
-            )
-        if config.get("profile") != REFERENCE_VARIANT:
-            mismatches.append(
-                f"profile {config.get('profile')!r} != "
-                f"{REFERENCE_VARIANT!r}"
-            )
-
-        actual = {
-            "n_steps": model.n_steps,
-            "batch_size": model.batch_size,
-            "n_epochs": model.n_epochs,
-            "gamma": model.gamma,
-            "gae_lambda": model.gae_lambda,
-            "ent_coef": model.ent_coef,
-            "vf_coef": model.vf_coef,
-            "max_grad_norm": model.max_grad_norm,
-        }
-        for key, expected in actual.items():
-            if not _same_number(expected, REFERENCE_PPO_KWARGS[key]):
-                mismatches.append(
-                    f"{key} {expected!r} != {REFERENCE_PPO_KWARGS[key]!r}"
-                )
-        if not _same_number(
-            _schedule_value(model.learning_rate), REFERENCE_LEARNING_RATE
-        ):
-            mismatches.append(
-                f"learning_rate {_schedule_value(model.learning_rate)!r} != "
-                f"{REFERENCE_LEARNING_RATE!r}"
-            )
-        if not _same_number(
-            _schedule_value(model.clip_range),
-            REFERENCE_PPO_KWARGS["clip_range"],
-        ):
-            mismatches.append(
-                f"clip_range {_schedule_value(model.clip_range)!r} != "
-                f"{REFERENCE_PPO_KWARGS['clip_range']!r}"
-            )
-        net_arch = (getattr(model, "policy_kwargs", None) or {}).get(
-            "net_arch"
+        raise SystemExit(
+            f"error: cannot resume {args.variant} without {config_path}"
         )
-        if net_arch != REFERENCE_PPO_KWARGS["policy_kwargs"]["net_arch"]:
-            mismatches.append(f"net_arch {net_arch!r} != [64, 64] pi/vf")
-        if getattr(model, "n_envs", None) != 1:
-            mismatches.append(f"n_envs {getattr(model, 'n_envs', None)!r} != 1")
+    config = _load_config(config_path)
+    if not config:
+        raise SystemExit(
+            f"error: {config_path} is invalid or unreadable; refusing to "
+            f"resume from it"
+        )
+    mismatches: list[str] = []
+    variant = args.variant
+    expected_algorithm = "TrulyPPO" if variant == TRULY_VARIANT else "PPO"
 
-        saved_ppo = config.get("ppo") or {}
-        for key in (
-            "n_steps",
-            "batch_size",
-            "n_epochs",
-            "gamma",
-            "gae_lambda",
-            "clip_range",
-            "ent_coef",
-            "vf_coef",
-            "max_grad_norm",
-        ):
-            if not _same_number(saved_ppo.get(key), REFERENCE_PPO_KWARGS[key]):
-                mismatches.append(
-                    f"config ppo.{key} {saved_ppo.get(key)!r} != "
-                    f"{REFERENCE_PPO_KWARGS[key]!r}"
-                )
+    if config.get("variant") != variant:
+        mismatches.append(
+            f"variant {config.get('variant')!r} != {variant!r}"
+        )
+    if config.get("seed") != args.seed:
+        mismatches.append(f"seed {config.get('seed')!r} != {args.seed!r}")
+    if config.get("profile") != REFERENCE_PROFILE:
+        mismatches.append(
+            f"profile {config.get('profile')!r} != {REFERENCE_PROFILE!r}"
+        )
+    if config.get("environment") != "Walker2d-v5":
+        mismatches.append(
+            f"environment {config.get('environment')!r} != 'Walker2d-v5'"
+        )
+    if config.get("algorithm") != expected_algorithm:
+        mismatches.append(
+            f"algorithm {config.get('algorithm')!r} != "
+            f"{expected_algorithm!r}"
+        )
+
+    actual = {
+        "n_steps": model.n_steps,
+        "batch_size": model.batch_size,
+        "n_epochs": model.n_epochs,
+        "gamma": model.gamma,
+        "gae_lambda": model.gae_lambda,
+        "ent_coef": model.ent_coef,
+        "vf_coef": model.vf_coef,
+        "max_grad_norm": model.max_grad_norm,
+    }
+    for key, expected in actual.items():
+        if not _same_number(expected, REFERENCE_PPO_KWARGS[key]):
+            mismatches.append(
+                f"{key} {expected!r} != {REFERENCE_PPO_KWARGS[key]!r}"
+            )
+    if not _same_number(
+        _schedule_value(model.learning_rate), REFERENCE_LEARNING_RATE
+    ):
+        mismatches.append(
+            f"learning_rate {_schedule_value(model.learning_rate)!r} != "
+            f"{REFERENCE_LEARNING_RATE!r}"
+        )
+    if not _same_number(
+        _schedule_value(model.clip_range),
+        REFERENCE_PPO_KWARGS["clip_range"],
+    ):
+        mismatches.append(
+            f"clip_range {_schedule_value(model.clip_range)!r} != "
+            f"{REFERENCE_PPO_KWARGS['clip_range']!r}"
+        )
+    net_arch = (getattr(model, "policy_kwargs", None) or {}).get("net_arch")
+    if net_arch != REFERENCE_PPO_KWARGS["policy_kwargs"]["net_arch"]:
+        mismatches.append(f"net_arch {net_arch!r} != [64, 64] pi/vf")
+    if getattr(model, "n_envs", None) != 1:
+        mismatches.append(f"n_envs {getattr(model, 'n_envs', None)!r} != 1")
+
+    saved_ppo = config.get("ppo") or {}
+    for key in (
+        "n_steps",
+        "batch_size",
+        "n_epochs",
+        "gamma",
+        "gae_lambda",
+        "clip_range",
+        "ent_coef",
+        "vf_coef",
+        "max_grad_norm",
+    ):
+        if not _same_number(saved_ppo.get(key), REFERENCE_PPO_KWARGS[key]):
+            mismatches.append(
+                f"config ppo.{key} {saved_ppo.get(key)!r} != "
+                f"{REFERENCE_PPO_KWARGS[key]!r}"
+            )
+    if not _same_number(
+        saved_ppo.get("learning_rate_initial"), REFERENCE_LEARNING_RATE
+    ):
+        mismatches.append(
+            "config ppo.learning_rate_initial "
+            f"{saved_ppo.get('learning_rate_initial')!r} != "
+            f"{REFERENCE_LEARNING_RATE!r}"
+        )
+    if saved_ppo.get("learning_rate_schedule") != "constant":
+        mismatches.append(
+            "config ppo.learning_rate_schedule "
+            f"{saved_ppo.get('learning_rate_schedule')!r} != 'constant'"
+        )
+    saved_net = (saved_ppo.get("policy_kwargs") or {}).get("net_arch")
+    if saved_net != REFERENCE_PPO_KWARGS["policy_kwargs"]["net_arch"]:
+        mismatches.append(f"config ppo.net_arch {saved_net!r} != [64, 64] pi/vf")
+
+    normalization = config.get("normalization") or {}
+    if not (
+        normalization.get("observations")
+        and normalization.get("rewards")
+    ):
+        mismatches.append("config normalization obs/reward is not enabled")
+
+    actor = config.get("actor")
+    if not isinstance(actor, dict):
+        if variant == REFERENCE_VARIANT:
+            # Reference runs written before the explicit actor record used
+            # exactly the same PPO objective, so they remain resumable.
+            actor = {"objective": ACTOR_OBJECTIVES[variant]}
+        else:
+            mismatches.append("config actor record is missing")
+            actor = {}
+    if actor.get("objective") != ACTOR_OBJECTIVES[variant]:
+        mismatches.append(
+            f"actor objective {actor.get('objective')!r} != "
+            f"{ACTOR_OBJECTIVES[variant]!r}"
+        )
+    if variant == TRULY_VARIANT:
+        rollback = actor.get("kl_rollback") or {}
+        if not _same_number(rollback.get("alpha"), TrulyPPO.truly_alpha):
+            mismatches.append(
+                f"actor alpha {rollback.get('alpha')!r} != "
+                f"{TrulyPPO.truly_alpha!r}"
+            )
+        if not _same_number(rollback.get("delta"), TrulyPPO.truly_delta):
+            mismatches.append(
+                f"actor delta {rollback.get('delta')!r} != "
+                f"{TrulyPPO.truly_delta!r}"
+            )
         if not _same_number(
-            saved_ppo.get("learning_rate_initial"), REFERENCE_LEARNING_RATE
+            getattr(model, "truly_alpha", None), TrulyPPO.truly_alpha
         ):
             mismatches.append(
-                "config ppo.learning_rate_initial "
-                f"{saved_ppo.get('learning_rate_initial')!r} != "
-                f"{REFERENCE_LEARNING_RATE!r}"
+                f"model truly_alpha {getattr(model, 'truly_alpha', None)!r} "
+                f"!= {TrulyPPO.truly_alpha!r}"
             )
-        normalization = config.get("normalization") or {}
-        if not (
-            normalization.get("observations")
-            and normalization.get("rewards")
+        if not _same_number(
+            getattr(model, "truly_delta", None), TrulyPPO.truly_delta
         ):
-            mismatches.append("config normalization obs/reward is not enabled")
-    else:
-        if "variant" in config and config["variant"] != args.variant:
             mismatches.append(
-                f"variant {config['variant']!r} != {args.variant!r}"
+                f"model truly_delta {getattr(model, 'truly_delta', None)!r} "
+                f"!= {TrulyPPO.truly_delta!r}"
             )
-        if "seed" in config and config["seed"] != args.seed:
-            mismatches.append(f"seed {config['seed']!r} != {args.seed!r}")
 
     if mismatches:
         raise SystemExit(
@@ -342,7 +421,6 @@ def build_run_config(
     args: argparse.Namespace,
     run_dir: Path,
     *,
-    normalized: bool,
     previous_config: dict,
     resumed_from: Path | None,
     start_timesteps: int,
@@ -354,21 +432,17 @@ def build_run_config(
     git: dict,
     hashes: dict,
 ) -> dict:
-    reference = args.variant == REFERENCE_VARIANT
-    ppo_kwargs = model_kwargs_for_variant(args.variant)
-    learning_rate = learning_rate_for_variant(args.variant)
-    schedule = (
-        "constant"
-        if reference or not normalized
-        else "linear_to_zero"
-    )
+    variant = args.variant
+    ppo_kwargs = model_kwargs_for_variant(variant)
+    learning_rate = learning_rate_for_variant(variant)
     config = {
         "environment": "Walker2d-v5",
-        "variant": args.variant,
-        "profile": REFERENCE_VARIANT if reference else args.variant,
+        "variant": variant,
+        "profile": REFERENCE_PROFILE,
         "seed": args.seed,
         "requested_timesteps": args.timesteps,
-        "algorithm": "TrulyPPO" if args.variant == "truly-ppo" else "PPO",
+        "algorithm": "TrulyPPO" if variant == TRULY_VARIANT else "PPO",
+        "actor": actor_config_for_variant(variant),
         "resumed_from": str(resumed_from) if resumed_from is not None else None,
         "resume_start_timesteps": start_timesteps,
         "resume_history": resume_history,
@@ -383,15 +457,12 @@ def build_run_config(
         "segment_seconds": 0.0,
         "steps_per_second": None,
         "metrics_jsonl": str(run_dir / "metrics.jsonl"),
-        "monitor_csv": (
-            str(run_dir / "monitor.csv") if reference else None
-        ),
+        "monitor_csv": str(run_dir / "monitor.csv"),
         "ppo": {
             "policy": "MlpPolicy",
             **ppo_kwargs,
             "learning_rate_initial": learning_rate,
-            "learning_rate_schedule": schedule,
-            "clip_range_used": args.variant != "truly-ppo",
+            "learning_rate_schedule": "constant",
             "n_envs": 1,
             "policy_defaults": POLICY_DEFAULTS,
             "torch_threads": args.torch_threads,
@@ -402,11 +473,23 @@ def build_run_config(
             "clip_obs": 10.0,
             "clip_reward": 10.0,
             "gamma": ppo_kwargs["gamma"],
-        } if normalized else None,
-        "truly_ppo": {
-            "alpha": TrulyPPO.truly_alpha,
-            "delta": TrulyPPO.truly_delta,
-        } if args.variant == "truly-ppo" else None,
+        },
+        "recipe": {
+            "profile": REFERENCE_PROFILE,
+            "source_url": REFERENCE_SOURCE_URL,
+            "source_environment": "Walker2d-v4",
+            "environment_label": (
+                "Walker2d-v5 (Walker2d-v4 reference hyperparameters "
+                "ported unchanged to v5)"
+            ),
+            "truly_ppo_source": TRULY_PPO_SOURCE,
+            "shared_note": (
+                "Both arms share environment, normalization, network, "
+                "learning rate and schedule, rollout settings, value and "
+                "entropy coefficients, seed, evaluation, and budget. Only "
+                "the actor objective differs."
+            ),
+        },
         "eval": {
             "enabled": eval_enabled,
             "eval_every": args.eval_every,
@@ -431,16 +514,6 @@ def build_run_config(
         "git": git,
         "source_sha256": hashes,
     }
-    if reference:
-        config["reference"] = {
-            "source_url": REFERENCE_SOURCE_URL,
-            "source_environment": "Walker2d-v4",
-            "environment_label": (
-                "Walker2d-v5 (Walker2d-v4 reference hyperparameters "
-                "ported unchanged to v5)"
-            ),
-            "profile": REFERENCE_VARIANT,
-        }
     return config
 
 
@@ -478,36 +551,16 @@ def latest_checkpoint(checkpoint_dir: Path) -> Path | None:
     return max(candidates)[1]
 
 
-def clear_stale_artifacts(run_dir: Path, checkpoint_dir: Path) -> list[Path]:
-    """Remove artifacts of a discarded run before training the same directory
-    from scratch, so a later resume cannot pick up a mismatched checkpoint."""
-    removed: list[Path] = []
-    for path in (run_dir / "final_model.zip", run_dir / "vecnormalize.pkl"):
-        if path.exists():
-            path.unlink()
-            removed.append(path)
-    if checkpoint_dir.is_dir():
-        for path in sorted(checkpoint_dir.iterdir()):
-            if path.is_file():
-                path.unlink()
-                removed.append(path)
-    return removed
-
-
 def vecnormalize_path_for(model_path: Path) -> Path:
     match = CHECKPOINT_PATTERN.match(model_path.name)
     if match is not None:
-        sibling = model_path.parent / (
+        return model_path.parent / (
             f"{match.group('prefix')}_vecnormalize_{match.group('steps')}_steps.pkl"
         )
-        if sibling.exists():
-            return sibling
     return model_path.parent / "vecnormalize.pkl"
 
 
-def find_resume_point(
-    run_dir: Path, *, normalized: bool
-) -> tuple[Path, Path | None] | None:
+def find_resume_point(run_dir: Path) -> tuple[Path, Path] | None:
     """Pick `final_model.zip` if present, otherwise the latest checkpoint."""
     final_model = run_dir / "final_model.zip"
     model_path = final_model if final_model.exists() else latest_checkpoint(
@@ -515,12 +568,10 @@ def find_resume_point(
     )
     if model_path is None:
         return None
-    return model_path, _require_stats(model_path, normalized=normalized)
+    return model_path, _require_stats(model_path)
 
 
-def _require_stats(model_path: Path, *, normalized: bool) -> Path | None:
-    if not normalized:
-        return None
+def _require_stats(model_path: Path) -> Path:
     stats_path = vecnormalize_path_for(model_path)
     if not stats_path.exists():
         raise FileNotFoundError(
@@ -530,19 +581,17 @@ def _require_stats(model_path: Path, *, normalized: bool) -> Path | None:
     return stats_path
 
 
-def resolve_resume(
-    spec: str, run_dir: Path, *, normalized: bool
-) -> tuple[Path, Path | None] | None:
-    """Resolve `--resume` into (model path, vecnormalize path or None)."""
+def resolve_resume(spec: str, run_dir: Path) -> tuple[Path, Path] | None:
+    """Resolve `--resume` into (model path, vecnormalize path)."""
     if spec == "auto":
-        point = find_resume_point(run_dir, normalized=normalized)
+        point = find_resume_point(run_dir)
         if point is None:
-            print(f"No final model or checkpoint in {run_dir}; starting fresh.")
+            print(f"No final model or checkpoint in {run_dir}; cannot resume.")
         return point
 
     path = Path(spec)
     if path.is_dir():
-        point = find_resume_point(path, normalized=normalized)
+        point = find_resume_point(path)
         if point is None:
             raise FileNotFoundError(
                 f"No final_model.zip or checkpoint found under {path}"
@@ -554,17 +603,30 @@ def resolve_resume(
         raise ValueError(
             "--resume expects a run directory, a model .zip file, or 'auto'"
         )
-    return path, _require_stats(path, normalized=normalized)
+    return path, _require_stats(path)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train PPO on Walker2d-v5.")
-    parser.add_argument("--variant", choices=VARIANTS, required=True)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train one of the two shared-profile Walker2d-v5 arms: the "
+            "standard PPO-Clip reference or Truly PPO."
+        )
+    )
+    parser.add_argument(
+        "--variant",
+        choices=VARIANTS,
+        default=DEFAULT_VARIANT,
+        help=(
+            "ppo-reference trains standard PPO-Clip; truly-ppo replaces only "
+            "the actor objective with Truly PPO's KL-triggered rollback."
+        ),
+    )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument(
         "--timesteps",
         type=int,
-        default=1_500_000,
+        default=1_000_000,
         help="Absolute total step budget for the run. When resuming, only the "
              "remaining steps are trained.",
     )
@@ -603,36 +665,45 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    _require_supported_variant(args.variant)
     run_dir = args.run_dir or default_run_dir(args.variant, args.seed)
-    normalized = normalized_for_variant(args.variant)
-    reference = args.variant == REFERENCE_VARIANT
     eval_enabled = args.eval_every > 0
-
-    # Validate/refuse before touching an existing reference run directory.
-    if reference:
-        ensure_reference_run_dir_available(run_dir, args.resume)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir = run_dir / "checkpoints"
-    checkpoint_dir.mkdir(exist_ok=True)
+    print(
+        f"variant={args.variant} shared_profile={REFERENCE_PROFILE} "
+        f"run_dir={run_dir}"
+    )
 
     torch.set_num_threads(args.torch_threads)
-    model_class = TrulyPPO if args.variant == "truly-ppo" else PPO
+    model_class = model_class_for_variant(args.variant)
     learning_rate = learning_rate_for_variant(args.variant)
     model_kwargs = model_kwargs_for_variant(args.variant)
 
     try:
         resume_point = (
-            resolve_resume(args.resume, run_dir, normalized=normalized)
+            resolve_resume(args.resume, run_dir)
             if args.resume is not None
             else None
         )
     except (FileNotFoundError, ValueError) as error:
         raise SystemExit(f"error: {error}") from error
 
-    if reference and resume_point is None:
-        # `--resume auto` with nothing to resume must not silently overwrite an
-        # existing reference run either.
-        ensure_reference_run_dir_available(run_dir, None)
+    if args.resume is not None and resume_point is None:
+        raise SystemExit(
+            f"error: --resume found no final_model.zip or checkpoint in "
+            f"{run_dir}; refusing to start a new run under a resume flag"
+        )
+
+    # Both arms own their directory. A resume from inside it may reuse its
+    # artifacts; a fresh start or an external resume may not overwrite them.
+    ensure_run_dir_available(
+        run_dir,
+        allow_existing_from=(
+            resume_point[0] if resume_point is not None else None
+        ),
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(exist_ok=True)
 
     env = None
     eval_env = None
@@ -647,17 +718,8 @@ def main() -> None:
 
     try:
         if resume_point is None:
-            if not reference:
-                discarded = clear_stale_artifacts(run_dir, checkpoint_dir)
-                if discarded:
-                    print(
-                        f"Starting from scratch; removed {len(discarded)} "
-                        f"artifact(s) of the previous run in {run_dir}"
-                    )
-            monitor_path = run_dir / "monitor.csv" if reference else None
-            env = make_training_env(
-                normalized, monitor_path=monitor_path
-            )
+            monitor_path = run_dir / "monitor.csv"
+            env = make_training_env(monitor_path=monitor_path)
             model = model_class(
                 "MlpPolicy",
                 env,
@@ -669,24 +731,19 @@ def main() -> None:
             )
         else:
             resumed_from, stats_path = resume_point
-            monitor_path = run_dir / "monitor.csv" if reference else None
+            monitor_path = run_dir / "monitor.csv"
             env = make_training_env(
-                normalized,
                 stats_path,
                 monitor_path=monitor_path,
-                monitor_append=(
-                    monitor_path is not None and monitor_path.exists()
-                ),
+                monitor_append=monitor_path.exists(),
             )
             model = model_class.load(
                 resumed_from, env=env, device="cpu", print_system_info=False
             )
             # Validate the saved model before overriding its schedules.
-            validate_resume(
-                run_dir, args, model, normalized=normalized
-            )
+            validate_resume(run_dir, args, model)
             # `load` restores the pickled schedule; rebuild it from this module
-            # so a resumed run keeps annealing against the absolute budget.
+            # so a resumed run keeps the same constant reference rate.
             model.learning_rate = learning_rate
             model._setup_lr_schedule()
             model.tensorboard_log = str(run_dir / "tensorboard")
@@ -694,8 +751,7 @@ def main() -> None:
             start_timesteps = int(model.num_timesteps)
             print(f"Resuming from {resumed_from} at {start_timesteps} steps")
 
-        # A fresh start discards the previous run, so its history and timing
-        # must not be carried over.
+        # Only a resume carries previous history and timing forward.
         if resumed_from is not None:
             previous_config = _load_config(config_path)
         remaining = args.timesteps - model.num_timesteps
@@ -717,7 +773,6 @@ def main() -> None:
         state = build_run_config(
             args,
             run_dir,
-            normalized=normalized,
             previous_config=previous_config,
             resumed_from=resumed_from,
             start_timesteps=start_timesteps,
@@ -757,7 +812,7 @@ def main() -> None:
                 save_path=str(checkpoint_dir),
                 name_prefix=CHECKPOINT_PREFIX,
                 save_replay_buffer=False,
-                save_vecnormalize=normalized,
+                save_vecnormalize=True,
             ),
             TrainingMetricsCallback(),
         ]
@@ -766,14 +821,11 @@ def main() -> None:
             callbacks[0].n_calls = start_timesteps
 
         if eval_enabled:
-            eval_env = make_eval_env(normalized)
+            eval_env = make_eval_env()
             eval_callback = HealthyEvalCallback(
                 eval_env=eval_env,
-                callback_on_new_best=(
-                    SaveVecNormalizeOnBest(
-                        run_dir / "best" / "vecnormalize.pkl"
-                    )
-                    if normalized else None
+                callback_on_new_best=SaveVecNormalizeOnBest(
+                    run_dir / "best" / "vecnormalize.pkl"
                 ),
                 n_eval_episodes=args.eval_episodes,
                 eval_freq=args.eval_every,
@@ -811,8 +863,7 @@ def main() -> None:
                 model.logger.dump(model.num_timesteps)
             segment_seconds = time.perf_counter() - start
             model.save(run_dir / "final_model")
-            if normalized:
-                env.save(run_dir / "vecnormalize.pkl")
+            env.save(run_dir / "vecnormalize.pkl")
         except BaseException as error:
             segment_seconds = time.perf_counter() - start
             state["status"] = (

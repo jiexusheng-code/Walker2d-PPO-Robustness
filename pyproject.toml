@@ -1,7 +1,7 @@
 [project]
 name = "walker2d-ppo-robustness"
 version = "0.1.0"
-description = "A reproducible PPO baseline and dynamics-randomization comparison on Gymnasium Walker2d-v5."
+description = "A shared-recipe PPO-Clip and Truly PPO comparison on Gymnasium Walker2d-v5."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [

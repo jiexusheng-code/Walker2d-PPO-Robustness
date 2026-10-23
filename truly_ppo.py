@@ -19,7 +19,13 @@ def truly_ppo_actor_loss(
     alpha: float = 5.0,
     delta: float = 0.03,
 ) -> tuple[th.Tensor, th.Tensor]:
-    """Return the Truly PPO actor loss and its per-sample rollback mask."""
+    """Return the Truly PPO actor loss and its per-sample rollback mask.
+
+    The trigger follows the authors' implementation (``kl >= delta`` and
+    ``ratio * advantage > advantage``), which is equivalent to the strict
+    ``(ratio - 1) * advantage > 0`` used here. The paper's constant offset in
+    the non-triggered branch is omitted because it has zero gradient.
+    """
     trigger = (kl_old_new >= delta) & ((ratio - 1.0) * advantages > 0.0)
     unclipped_objective = ratio * advantages
     rollback_objective = unclipped_objective - alpha * kl_old_new

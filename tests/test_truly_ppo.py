@@ -9,7 +9,7 @@ import torch
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from envs import make_env
-from train import linear_schedule, make_training_env
+from train import make_training_env
 from truly_ppo import TrulyPPO, truly_ppo_actor_loss
 
 
@@ -88,6 +88,15 @@ class TrulyPPOTests(unittest.TestCase):
 
         self.assertFalse(bool(trigger.any()))
 
+    def test_ratio_one_with_high_kl_never_triggers(self) -> None:
+        ratio = torch.tensor([1.0, 1.0])
+        advantages = torch.tensor([1.0, -1.0])
+        kl = torch.tensor([0.04, 0.04])
+
+        _, trigger = truly_ppo_actor_loss(ratio, advantages, kl)
+
+        self.assertFalse(bool(trigger.any()))
+
     def test_use_sde_is_rejected(self) -> None:
         env = DummyVecEnv([make_env])
         try:
@@ -124,13 +133,8 @@ class TrulyPPOTests(unittest.TestCase):
         finally:
             env.close()
 
-    def test_linear_learning_rate_schedule_endpoints(self) -> None:
-        schedule = linear_schedule(3e-4)
-        self.assertAlmostEqual(schedule(1.0), 3e-4)
-        self.assertEqual(schedule(0.0), 0.0)
-
     def test_vecnormalize_statistics_reload_for_evaluation(self) -> None:
-        training_env = make_training_env(normalize=True)
+        training_env = make_training_env()
         raw_env = make_env()
         loaded_env = None
         try:

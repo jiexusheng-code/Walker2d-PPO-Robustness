@@ -42,8 +42,9 @@ else
 fi
 
 case "$RUN_DIR_ABS" in
-  "$REPO_ROOT/runs/main"|"$REPO_ROOT/runs/main/"*)
-    printf 'error: refusing to write under runs/main: %s\n' "$RUN_DIR_ABS" >&2
+  "$REPO_ROOT/runs/main"|"$REPO_ROOT/runs/main/"*|\
+  "$REPO_ROOT/runs/two_arm"|"$REPO_ROOT/runs/two_arm/"*)
+    printf 'error: refusing to write under formal results (runs/main or runs/two_arm): %s\n' "$RUN_DIR_ABS" >&2
     exit 1
     ;;
 esac
@@ -79,7 +80,8 @@ run_logged() {
 
 trap 'code=$?; log "pilot_reference.sh exited with code $code"' EXIT
 
-log "reference pilot: variant=ppo-reference seed=$SEED timesteps=$TIMESTEPS"
+log "single-group reference pilot: variant=ppo-reference seed=$SEED timesteps=$TIMESTEPS"
+log "This script trains only ppo-reference. Use scripts/run_matrix.sh for the two-arm comparison."
 log "eval_every=$EVAL_EVERY eval_episodes=$EVAL_EPISODES eval_seed=$EVAL_SEED"
 log "final_episodes=$FINAL_EPISODES final_eval_seed=$FINAL_EVAL_SEED resume=$RESUME"
 log "run directory: $RUN_DIR_ABS"

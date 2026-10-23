@@ -17,10 +17,12 @@ from diagnostics import (
 )
 
 
-def _reference_args() -> types.SimpleNamespace:
+def _args(
+    variant: str = train.REFERENCE_VARIANT, seed: int = 3
+) -> types.SimpleNamespace:
     return types.SimpleNamespace(
-        variant=train.REFERENCE_VARIANT,
-        seed=3,
+        variant=variant,
+        seed=seed,
         timesteps=1_000_000,
         torch_threads=1,
         eval_every=10_000,
@@ -29,7 +31,7 @@ def _reference_args() -> types.SimpleNamespace:
     )
 
 
-def _fake_reference_model(**overrides):
+def _fake_model(variant: str = train.REFERENCE_VARIANT, **overrides):
     values = {
         "n_steps": train.REFERENCE_PPO_KWARGS["n_steps"],
         "batch_size": train.REFERENCE_PPO_KWARGS["batch_size"],
@@ -43,99 +45,144 @@ def _fake_reference_model(**overrides):
         "clip_range": train.REFERENCE_PPO_KWARGS["clip_range"],
         "policy_kwargs": train.REFERENCE_PPO_KWARGS["policy_kwargs"],
         "n_envs": 1,
+        "truly_alpha": train.TrulyPPO.truly_alpha,
+        "truly_delta": train.TrulyPPO.truly_delta,
     }
     values.update(overrides)
     return types.SimpleNamespace(**values)
 
 
-class ReferenceProfileTests(unittest.TestCase):
-    def test_reference_hyperparameters_and_learning_rate_are_fixed(self) -> None:
-        self.assertEqual(
-            train.REFERENCE_PPO_KWARGS,
-            {
-                "n_steps": 512,
-                "batch_size": 32,
-                "n_epochs": 20,
-                "gamma": 0.99,
-                "gae_lambda": 0.95,
-                "clip_range": 0.1,
-                "ent_coef": 0.000585045,
-                "vf_coef": 0.871923,
-                "max_grad_norm": 1.0,
-                "policy_kwargs": {
-                    "net_arch": {"pi": [64, 64], "vf": [64, 64]}
-                },
-                "device": "cpu",
-            },
+def _write_config(
+    run_dir: Path,
+    *,
+    variant: str = train.REFERENCE_VARIANT,
+    profile: str = train.REFERENCE_PROFILE,
+    seed: int = 3,
+    ppo_overrides: dict | None = None,
+    actor: dict | None | str = "default",
+    normalization: dict | None = None,
+) -> None:
+    ppo = {
+        key: train.REFERENCE_PPO_KWARGS[key]
+        for key in (
+            "n_steps",
+            "batch_size",
+            "n_epochs",
+            "gamma",
+            "gae_lambda",
+            "clip_range",
+            "ent_coef",
+            "vf_coef",
+            "max_grad_norm",
         )
-        self.assertEqual(train.REFERENCE_LEARNING_RATE, 5.05041e-5)
+    }
+    ppo["learning_rate_initial"] = train.REFERENCE_LEARNING_RATE
+    ppo["learning_rate_schedule"] = "constant"
+    ppo["policy_kwargs"] = train.REFERENCE_PPO_KWARGS["policy_kwargs"]
+    ppo.update(ppo_overrides or {})
+    config = {
+        "variant": variant,
+        "seed": seed,
+        "profile": profile,
+        "environment": "Walker2d-v5",
+        "algorithm": "TrulyPPO" if variant == train.TRULY_VARIANT else "PPO",
+        "ppo": ppo,
+        "normalization": (
+            {"observations": True, "rewards": True}
+            if normalization is None else normalization
+        ),
+    }
+    if actor == "default":
+        config["actor"] = train.actor_config_for_variant(variant)
+    elif actor is not None:
+        config["actor"] = actor
+    (run_dir / "config.json").write_text(
+        json.dumps(config), encoding="utf-8"
+    )
+
+
+class SharedProfileTests(unittest.TestCase):
+    def test_project_exposes_only_two_arms_with_one_profile(self) -> None:
         self.assertEqual(
-            train.learning_rate_for_variant(train.REFERENCE_VARIANT),
-            train.REFERENCE_LEARNING_RATE,
+            train.VARIANTS,
+            (train.REFERENCE_VARIANT, train.TRULY_VARIANT),
         )
-        self.assertTrue(
-            train.normalized_for_variant(train.REFERENCE_VARIANT)
+        self.assertEqual(train.DEFAULT_VARIANT, train.REFERENCE_VARIANT)
+        self.assertEqual(train.REFERENCE_PROFILE, train.REFERENCE_VARIANT)
+        for variant in train.VARIANTS:
+            self.assertIs(
+                train.model_kwargs_for_variant(variant),
+                train.REFERENCE_PPO_KWARGS,
+            )
+            self.assertEqual(
+                train.learning_rate_for_variant(variant),
+                train.REFERENCE_LEARNING_RATE,
+            )
+            self.assertEqual(
+                train.default_run_dir(variant, 7),
+                Path("runs") / variant / "seed_7",
+            )
+        self.assertIs(
+            train.model_class_for_variant(train.REFERENCE_VARIANT), train.PPO
         )
         self.assertIs(
-            train.model_kwargs_for_variant(train.REFERENCE_VARIANT),
-            train.REFERENCE_PPO_KWARGS,
+            train.model_class_for_variant(train.TRULY_VARIANT), train.TrulyPPO
         )
-        self.assertEqual(
-            train.default_run_dir(train.REFERENCE_VARIANT, 7),
-            Path("runs") / "ppo-reference" / "seed_7",
-        )
+        with self.assertRaises(SystemExit):
+            train.model_kwargs_for_variant("baseline")
+        with self.assertRaises(SystemExit):
+            train.model_class_for_variant("ppo-normalized")
 
-    def test_old_variants_keep_their_profile(self) -> None:
-        self.assertIs(
-            train.model_kwargs_for_variant("baseline"),
-            train.TOTAL_PPO_KWARGS,
-        )
-        self.assertEqual(
-            train.learning_rate_for_variant("baseline"),
-            train.INITIAL_LEARNING_RATE,
-        )
-        self.assertTrue(
-            callable(train.learning_rate_for_variant("ppo-normalized"))
-        )
-        self.assertEqual(
-            train.default_run_dir("baseline", 4),
-            Path("runs") / "baseline" / "seed_4",
-        )
+    def test_config_records_shared_settings_and_actor_difference(self) -> None:
+        configs = {}
+        for variant in train.VARIANTS:
+            run_dir = Path("runs") / variant / "seed_3"
+            configs[variant] = train.build_run_config(
+                _args(variant),
+                run_dir,
+                previous_config={},
+                resumed_from=None,
+                start_timesteps=0,
+                resume_history=[],
+                segments=[],
+                eval_enabled=True,
+                versions={"stable_baselines3": "2.9.0"},
+                runtime={"utc_started": "2026-01-01T00:00:00+00:00"},
+                git={"commit": "abc", "dirty": False},
+                hashes={"train.py": "deadbeef"},
+            )
 
-    def test_config_records_reference_metadata_and_running_status(self) -> None:
-        args = _reference_args()
-        run_dir = Path("runs") / "ppo-reference" / "seed_3"
-        config = train.build_run_config(
-            args,
-            run_dir,
-            normalized=True,
-            previous_config={},
-            resumed_from=None,
-            start_timesteps=0,
-            resume_history=[],
-            segments=[],
-            eval_enabled=True,
-            versions={"stable_baselines3": "2.9.0"},
-            runtime={"utc_started": "2026-01-01T00:00:00+00:00"},
-            git={"commit": "abc", "dirty": False},
-            hashes={"train.py": "deadbeef"},
-        )
+        reference = configs[train.REFERENCE_VARIANT]
+        truly = configs[train.TRULY_VARIANT]
+        for key in (
+            "environment",
+            "profile",
+            "seed",
+            "requested_timesteps",
+            "ppo",
+            "normalization",
+            "eval",
+            "recipe",
+            "versions",
+            "git",
+            "source_sha256",
+        ):
+            self.assertEqual(reference[key], truly[key], key)
 
-        self.assertEqual(config["status"], "running")
-        self.assertEqual(config["last_observed_timesteps"], 0)
-        self.assertIsNone(config["error_type"])
-        self.assertEqual(config["profile"], train.REFERENCE_VARIANT)
-        self.assertEqual(config["ppo"]["n_steps"], 512)
+        self.assertEqual(reference["profile"], train.REFERENCE_PROFILE)
+        self.assertEqual(truly["profile"], train.REFERENCE_PROFILE)
+        self.assertEqual(reference["algorithm"], "PPO")
+        self.assertEqual(truly["algorithm"], "TrulyPPO")
+        self.assertEqual(reference["ppo"]["n_steps"], 512)
         self.assertEqual(
-            config["ppo"]["learning_rate_initial"],
+            reference["ppo"]["learning_rate_initial"],
             train.REFERENCE_LEARNING_RATE,
         )
         self.assertEqual(
-            config["ppo"]["learning_rate_schedule"], "constant"
+            reference["ppo"]["learning_rate_schedule"], "constant"
         )
-        self.assertEqual(config["ppo"]["n_envs"], 1)
         self.assertEqual(
-            config["normalization"],
+            reference["normalization"],
             {
                 "observations": True,
                 "rewards": True,
@@ -144,89 +191,187 @@ class ReferenceProfileTests(unittest.TestCase):
                 "gamma": 0.99,
             },
         )
-        self.assertEqual(config["eval"]["eval_seed"], 50_000)
-        self.assertTrue(config["eval"]["enabled"])
-        self.assertEqual(
-            config["reference"]["source_environment"], "Walker2d-v4"
-        )
-        self.assertIn("Walker2d-v5", config["reference"]["environment_label"])
-        self.assertEqual(config["monitor_csv"], str(run_dir / "monitor.csv"))
-        self.assertEqual(
-            config["metrics_jsonl"], str(run_dir / "metrics.jsonl")
-        )
-        self.assertEqual(config["git"], {"commit": "abc", "dirty": False})
+        self.assertEqual(reference["monitor_csv"], str(
+            Path("runs") / train.REFERENCE_VARIANT / "seed_3" / "monitor.csv"
+        ))
 
-    def test_reference_overwrite_guard(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            run_dir = Path(directory)
-            (run_dir / "final_model.zip").touch()
-            self.assertTrue(train.reference_existing_artifacts(run_dir))
-            with self.assertRaises(SystemExit):
-                train.ensure_reference_run_dir_available(run_dir, None)
-            train.ensure_reference_run_dir_available(run_dir, "auto")
+        self.assertEqual(reference["actor"]["objective"], "ppo_clip")
+        self.assertTrue(reference["actor"]["clip_range_used"])
+        self.assertIsNone(reference["actor"]["kl_rollback"])
+        self.assertEqual(
+            truly["actor"]["objective"],
+            "truly_ppo_kl_triggered_rollback",
+        )
+        self.assertFalse(truly["actor"]["clip_range_used"])
+        self.assertEqual(truly["actor"]["kl_rollback"]["alpha"], 5.0)
+        self.assertEqual(truly["actor"]["kl_rollback"]["delta"], 0.03)
+        self.assertIn(
+            "no parameter", truly["actor"]["kl_rollback"]["note"]
+        )
+        self.assertIn("Walker2d-v4", reference["recipe"]["environment_label"])
+        self.assertIn("1903.07940", reference["recipe"]["truly_ppo_source"])
+        self.assertIn("C. Wen", reference["recipe"]["truly_ppo_source"])
+
+    def test_overwrite_guard_refuses_both_arms(self) -> None:
+        for variant in train.VARIANTS:
+            with tempfile.TemporaryDirectory() as directory:
+                run_dir = Path(directory)
+                (run_dir / "final_model.zip").touch()
+                with self.assertRaises(SystemExit):
+                    train.ensure_run_dir_available(run_dir)
+                with self.assertRaises(SystemExit):
+                    train.ensure_run_dir_available(
+                        run_dir,
+                        allow_existing_from=run_dir.parent / "elsewhere.zip",
+                    )
+                train.ensure_run_dir_available(
+                    run_dir,
+                    allow_existing_from=run_dir / "final_model.zip",
+                )
+                self.assertTrue(variant)
 
 
 class ResumeValidationTests(unittest.TestCase):
-    def _write_config(self, run_dir: Path) -> None:
-        ppo = {
-            key: value
-            for key, value in train.REFERENCE_PPO_KWARGS.items()
-            if key not in ("policy_kwargs", "device")
-        }
-        ppo["learning_rate_initial"] = train.REFERENCE_LEARNING_RATE
-        (run_dir / "config.json").write_text(
-            json.dumps({
-                "variant": train.REFERENCE_VARIANT,
-                "seed": 3,
-                "profile": train.REFERENCE_VARIANT,
-                "ppo": ppo,
-                "normalization": {
-                    "observations": True,
-                    "rewards": True,
-                },
-            }),
-            encoding="utf-8",
-        )
+    def test_resume_accepts_matching_config_for_both_arms(self) -> None:
+        for variant in train.VARIANTS:
+            with tempfile.TemporaryDirectory() as directory:
+                run_dir = Path(directory)
+                _write_config(run_dir, variant=variant)
+                train.validate_resume(
+                    run_dir, _args(variant), _fake_model(variant)
+                )
 
-    def test_reference_resume_accepts_matching_model(self) -> None:
+    def test_resume_rejects_shared_hyperparameter_mismatch_for_both(self) -> None:
+        for variant in train.VARIANTS:
+            with tempfile.TemporaryDirectory() as directory:
+                run_dir = Path(directory)
+                _write_config(run_dir, variant=variant)
+                with self.assertRaises(SystemExit):
+                    train.validate_resume(
+                        run_dir,
+                        _args(variant),
+                        _fake_model(variant, n_steps=2048),
+                    )
+                with self.assertRaises(SystemExit):
+                    train.validate_resume(
+                        run_dir,
+                        _args(variant),
+                        _fake_model(variant, learning_rate=3e-4),
+                    )
+
+    def test_resume_requires_config_for_both_arms(self) -> None:
+        for variant in train.VARIANTS:
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(SystemExit):
+                    train.validate_resume(
+                        Path(directory), _args(variant), _fake_model(variant)
+                    )
+
+    def test_resume_rejects_invalid_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)
-            self._write_config(run_dir)
-            train.validate_resume(
-                run_dir,
-                _reference_args(),
-                _fake_reference_model(),
-                normalized=True,
+            (run_dir / "config.json").write_text(
+                "{not json", encoding="utf-8"
             )
+            with self.assertRaises(SystemExit):
+                train.validate_resume(
+                    run_dir,
+                    _args(train.REFERENCE_VARIANT),
+                    _fake_model(),
+                )
 
-    def test_reference_resume_rejects_mismatched_hyperparameters(self) -> None:
+    def test_resume_rejects_old_truly_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory)
-            self._write_config(run_dir)
+            _write_config(
+                run_dir,
+                variant=train.TRULY_VARIANT,
+                profile="truly-ppo",
+                ppo_overrides={"n_steps": 2048, "batch_size": 64},
+                actor=None,
+            )
             with self.assertRaises(SystemExit):
                 train.validate_resume(
                     run_dir,
-                    _reference_args(),
-                    _fake_reference_model(n_steps=2048),
-                    normalized=True,
-                )
-            with self.assertRaises(SystemExit):
-                train.validate_resume(
-                    run_dir,
-                    _reference_args(),
-                    _fake_reference_model(learning_rate=3e-4),
-                    normalized=True,
+                    _args(train.TRULY_VARIANT),
+                    _fake_model(train.TRULY_VARIANT),
                 )
 
-    def test_reference_resume_requires_config(self) -> None:
+    def test_resume_rejects_wrong_variant(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            _write_config(run_dir, variant=train.REFERENCE_VARIANT)
             with self.assertRaises(SystemExit):
                 train.validate_resume(
-                    Path(directory),
-                    _reference_args(),
-                    _fake_reference_model(),
-                    normalized=True,
+                    run_dir,
+                    _args(train.TRULY_VARIANT),
+                    _fake_model(train.TRULY_VARIANT),
                 )
+
+    def test_resume_rejects_actor_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            _write_config(
+                run_dir,
+                variant=train.TRULY_VARIANT,
+                actor={
+                    "objective": "ppo_clip",
+                    "clip_range_used": True,
+                    "kl_rollback": None,
+                },
+            )
+            with self.assertRaises(SystemExit):
+                train.validate_resume(
+                    run_dir,
+                    _args(train.TRULY_VARIANT),
+                    _fake_model(train.TRULY_VARIANT),
+                )
+
+            _write_config(
+                run_dir,
+                variant=train.TRULY_VARIANT,
+                actor={
+                    "objective": train.ACTOR_OBJECTIVES[
+                        train.TRULY_VARIANT
+                    ],
+                    "clip_range_used": False,
+                    "kl_rollback": {
+                        "alpha": 5.0,
+                        "delta": 0.05,
+                    },
+                },
+            )
+            with self.assertRaises(SystemExit):
+                train.validate_resume(
+                    run_dir,
+                    _args(train.TRULY_VARIANT),
+                    _fake_model(train.TRULY_VARIANT),
+                )
+
+    def test_resume_rejects_missing_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            _write_config(
+                run_dir,
+                variant=train.REFERENCE_VARIANT,
+                normalization={},
+            )
+            with self.assertRaises(SystemExit):
+                train.validate_resume(
+                    run_dir, _args(train.REFERENCE_VARIANT), _fake_model()
+                )
+
+    def test_legacy_reference_config_without_actor_is_resumable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            _write_config(
+                run_dir,
+                variant=train.REFERENCE_VARIANT,
+                actor=None,
+            )
+            train.validate_resume(
+                run_dir, _args(train.REFERENCE_VARIANT), _fake_model()
+            )
 
 
 class DiagnosticsTests(unittest.TestCase):

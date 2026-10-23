@@ -1,8 +1,10 @@
 """Small, dependency-free decision helper for scripts/run_matrix.sh.
 
 The matrix must not mistake an older, shorter completed run for a run that
-satisfies the current budget.  It also must not silently overwrite an existing
-run when the budget grows without RESUME=1.
+satisfies the current budget. It also must not silently overwrite an existing
+run when the budget grows without RESUME=1, and it must not treat a stale
+evaluation (another model, statistics file, episode count, or base seed) as
+current.
 """
 
 from __future__ import annotations
@@ -16,10 +18,15 @@ from pathlib import Path
 from typing import Literal
 
 Action = Literal["skip", "evaluate", "train", "resume", "error"]
+TRAINING_VARIANTS = ("ppo-reference", "truly-ppo")
+REFERENCE_PROFILE = "ppo-reference"
+ACTOR_OBJECTIVES = {
+    "ppo-reference": "ppo_clip",
+    "truly-ppo": "truly_ppo_kl_triggered_rollback",
+}
 REQUIRED_CONDITIONS = {"nominal", "heldout_low", "heldout_high"}
-REFERENCE_VARIANT = "ppo-reference"
 INCOMPLETE_STATUSES = {"running", "interrupted", "failed"}
-REFERENCE_ARTIFACTS = (
+RUN_ARTIFACTS = (
     "final_model.zip",
     "vecnormalize.pkl",
     "config.json",
@@ -27,6 +34,7 @@ REFERENCE_ARTIFACTS = (
     "monitor.csv",
     "evaluations.npz",
 )
+DIRECTORY_ARTIFACTS = ("checkpoints", "best", "tensorboard", "evaluation")
 
 
 @dataclass(frozen=True)
@@ -78,17 +86,12 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def existing_artifacts(run_dir: Path, variant: str) -> list[Path]:
-    names = (
-        REFERENCE_ARTIFACTS
-        if variant == REFERENCE_VARIANT
-        else ("final_model.zip", "config.json")
-    )
-    found = [run_dir / name for name in names if (run_dir / name).exists()]
-    directories = ("checkpoints",)
-    if variant == REFERENCE_VARIANT:
-        directories += ("best", "tensorboard")
-    for name in directories:
+def existing_artifacts(run_dir: Path) -> list[Path]:
+    found = [
+        run_dir / name for name in RUN_ARTIFACTS
+        if (run_dir / name).exists()
+    ]
+    for name in DIRECTORY_ARTIFACTS:
         directory = run_dir / name
         if directory.is_dir() and any(directory.iterdir()):
             found.append(directory)
@@ -107,30 +110,103 @@ def _resolved_model_path(summary: dict, run_dir: Path) -> set[Path]:
     return {candidate.resolve() for candidate in candidates}
 
 
-def evaluation_is_current(run_dir: Path, variant: str) -> bool:
+def evaluation_current(
+    run_dir: Path, variant: str, episodes: int, eval_seed: int
+) -> tuple[bool, str]:
+    """Whether evaluation/summary.json describes this exact final result."""
     summary_path = run_dir / "evaluation" / "summary.json"
     summary = read_json(summary_path)
     if summary is None:
-        return False
-    if summary.get("variant") not in (None, variant):
-        return False
+        return False, "evaluation/summary.json is missing or invalid"
+    if summary.get("variant") != variant:
+        return False, (
+            f"evaluation variant {summary.get('variant')!r} != {variant!r}"
+        )
     expected_model = (run_dir / "final_model.zip").resolve()
     if not expected_model.is_file():
-        return False
+        return False, "final_model.zip is missing"
     if expected_model not in _resolved_model_path(summary, run_dir):
-        return False
+        return False, f"evaluation does not reference {expected_model}"
+    if summary.get("deterministic") is not True:
+        return False, "evaluation is not marked deterministic"
+
+    summary_model_hash = summary.get("model_sha256")
+    if not isinstance(summary_model_hash, str) or not summary_model_hash:
+        return False, "evaluation has no model SHA-256"
+    if file_sha256(expected_model) != summary_model_hash:
+        return False, "evaluation model SHA-256 does not match final_model.zip"
+
+    stats = run_dir / "vecnormalize.pkl"
+    if not stats.is_file():
+        return False, "vecnormalize.pkl is missing"
+    summary_stats_hash = summary.get("vecnormalize_sha256")
+    if not isinstance(summary_stats_hash, str) or not summary_stats_hash:
+        return False, "evaluation has no VecNormalize SHA-256"
+    if file_sha256(stats) != summary_stats_hash:
+        return False, (
+            "evaluation VecNormalize SHA-256 does not match vecnormalize.pkl"
+        )
+
+    if summary.get("episodes_per_condition") != episodes:
+        return False, (
+            f"evaluation has "
+            f"{summary.get('episodes_per_condition')!r} episodes per condition "
+            f"!= {episodes!r}"
+        )
+    if summary.get("base_seed") != eval_seed:
+        return False, (
+            f"evaluation base seed {summary.get('base_seed')!r} != "
+            f"{eval_seed!r}"
+        )
     conditions = summary.get("conditions")
     if not isinstance(conditions, dict):
-        return False
+        return False, "evaluation has no per-condition results"
     if not REQUIRED_CONDITIONS.issubset(conditions):
-        return False
+        missing = sorted(REQUIRED_CONDITIONS - set(conditions))
+        return False, f"evaluation is missing conditions: {', '.join(missing)}"
+    return True, "evaluation matches the final model, statistics, and protocol"
 
-    summary_hash = summary.get("model_sha256")
-    if isinstance(summary_hash, str) and summary_hash:
-        return file_sha256(expected_model) == summary_hash
-    # Legacy summaries predate model hashes. A summary written after the
-    # model was saved is the best available evidence that it matches.
-    return summary_path.stat().st_mtime_ns >= expected_model.stat().st_mtime_ns
+
+def _config_matches(
+    config: dict, variant: str, seed: int
+) -> tuple[bool, str]:
+    if config.get("variant") != variant:
+        return False, (
+            f"variant {config.get('variant')!r} != {variant!r}"
+        )
+    if config.get("seed") != seed:
+        return False, f"seed {config.get('seed')!r} != {seed!r}"
+    if config.get("profile") != REFERENCE_PROFILE:
+        return False, (
+            f"profile {config.get('profile')!r} != {REFERENCE_PROFILE!r}"
+        )
+    if config.get("environment") != "Walker2d-v5":
+        return False, (
+            f"environment {config.get('environment')!r} != 'Walker2d-v5'"
+        )
+    actor = config.get("actor")
+    actor_type = actor.get("objective") if isinstance(actor, dict) else None
+    expected_actor = ACTOR_OBJECTIVES[variant]
+    if actor_type is None:
+        # Reference runs written before the explicit actor record used the
+        # same PPO objective and remain compatible. A truly-ppo run without
+        # its actor record is an old, unsupported base.
+        if variant != "ppo-reference":
+            return False, "actor record is missing"
+    elif actor_type != expected_actor:
+        return False, (
+            f"actor objective {actor_type!r} != {expected_actor!r}"
+        )
+    return True, "configuration matches"
+
+
+def _has_resume_point(run_dir: Path) -> bool:
+    if (run_dir / "final_model.zip").is_file():
+        return True
+    checkpoint_dir = run_dir / "checkpoints"
+    return checkpoint_dir.is_dir() and any(
+        checkpoint_dir.glob("*_*_steps.zip")
+    )
 
 
 def plan_run(
@@ -139,12 +215,23 @@ def plan_run(
     variant: str,
     seed: int,
     budget: int,
+    episodes: int,
+    eval_seed: int,
     resume: bool,
 ) -> RunPlan:
     run_dir = Path(run_dir)
+    if variant not in TRAINING_VARIANTS:
+        return RunPlan(
+            "error",
+            f"unsupported training variant {variant!r}; this project trains "
+            f"only {', '.join(TRAINING_VARIANTS)}. Historical baseline models "
+            f"are supported only by evaluate.py",
+            None,
+        )
+
     config_path = run_dir / "config.json"
     config = read_json(config_path)
-    artifacts = existing_artifacts(run_dir, variant)
+    artifacts = existing_artifacts(run_dir)
     if config_path.exists() and config is None:
         return RunPlan(
             "error",
@@ -152,24 +239,23 @@ def plan_run(
             f"must not be overwritten; repair or remove them explicitly",
             None,
         )
-    config_matches = (
-        isinstance(config, dict)
-        and config.get("variant") == variant
-        and config.get("seed") == seed
-    )
-    if config is not None and not config_matches:
-        return RunPlan(
-            "error",
-            f"{config_path} does not match variant={variant} "
-            f"seed={seed}; refusing to reuse or resume it",
-            completed_steps(config),
-        )
-    if variant == REFERENCE_VARIANT and config is None and artifacts:
+    if config is not None:
+        config_ok, config_reason = _config_matches(config, variant, seed)
+        if not config_ok:
+            return RunPlan(
+                "error",
+                f"{config_path} does not match the current shared profile "
+                f"({config_reason}); refusing to reuse or resume it",
+                completed_steps(config),
+            )
+    else:
+        config_ok = False
+    if config is None and artifacts:
         listed = ", ".join(str(path) for path in artifacts)
         return RunPlan(
             "error",
-            f"cannot resume {REFERENCE_VARIANT} without {config_path}; "
-            f"existing artifacts: {listed}. Refusing to start fresh over them",
+            f"cannot resume {variant} without {config_path}; existing "
+            f"artifacts: {listed}. Refusing to start fresh over them",
             None,
         )
 
@@ -177,27 +263,53 @@ def plan_run(
     final_model = run_dir / "final_model.zip"
     complete = (
         final_model.is_file()
-        and config_matches
+        and config_ok
         and steps is not None
         and steps >= budget
         and not status_is_incomplete(config)
     )
+    if complete and not (run_dir / "vecnormalize.pkl").is_file():
+        return RunPlan(
+            "error",
+            f"completed run {run_dir} has no vecnormalize.pkl; refusing to "
+            f"evaluate with missing statistics. Restore it or use a new run "
+            f"directory",
+            steps,
+        )
     if complete:
-        if evaluation_is_current(run_dir, variant):
+        current, reason = evaluation_current(
+            run_dir, variant, episodes, eval_seed
+        )
+        if current:
             return RunPlan(
                 "skip",
-                f"completed {steps} steps >= budget {budget} and evaluation "
-                f"matches {final_model}",
+                f"completed {steps} steps >= budget {budget} and {reason}",
                 steps,
             )
         return RunPlan(
             "evaluate",
-            f"completed {steps} steps >= budget {budget}, but the evaluation "
-            f"is missing or does not match {final_model}",
+            f"completed {steps} steps >= budget {budget}, but {reason}",
             steps,
         )
 
     if resume:
+        if not _has_resume_point(run_dir):
+            if config is None and not artifacts:
+                # RESUME=1 is a matrix-wide mode. An untouched later arm is a
+                # fresh start, not a failure to resume.
+                return RunPlan(
+                    "train",
+                    f"no existing artifacts in {run_dir}; starting fresh "
+                    f"for budget {budget}",
+                    None,
+                )
+            return RunPlan(
+                "error",
+                f"no final_model.zip or checkpoint in {run_dir}; there is "
+                f"nothing to resume, and restarting over existing artifacts "
+                f"is refused",
+                steps,
+            )
         return RunPlan(
             "resume",
             f"resuming {run_dir} toward budget {budget} "
@@ -206,7 +318,10 @@ def plan_run(
         )
 
     if artifacts:
-        recorded = f"{steps} steps" if steps is not None else "an unverified step count"
+        recorded = (
+            f"{steps} steps" if steps is not None else
+            "an unverified step count"
+        )
         listed = ", ".join(str(path) for path in artifacts)
         return RunPlan(
             "error",
@@ -230,6 +345,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     plan_parser.add_argument("--variant", required=True)
     plan_parser.add_argument("--seed", type=int, required=True)
     plan_parser.add_argument("--budget", type=int, required=True)
+    plan_parser.add_argument("--episodes", type=int, required=True)
+    plan_parser.add_argument("--eval-seed", type=int, required=True)
     plan_parser.add_argument("--resume", action="store_true")
     return parser.parse_args(argv)
 
@@ -243,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
         variant=args.variant,
         seed=args.seed,
         budget=args.budget,
+        episodes=args.episodes,
+        eval_seed=args.eval_seed,
         resume=args.resume,
     )
     print(f"{plan.action}|{plan.reason}")

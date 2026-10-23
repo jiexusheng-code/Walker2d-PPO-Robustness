@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import platform
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,8 +24,11 @@ CONDITIONS = {
     "heldout_low": (0.7, 0.7),
     "heldout_high": (1.3, 1.3),
 }
-VARIANTS = ("baseline", "ppo-normalized", "truly-ppo", "ppo-reference")
-EVALUATOR_SCHEMA_VERSION = 2
+TRAINING_VARIANTS = ("ppo-reference", "truly-ppo")
+LEGACY_EVAL_VARIANTS = ("baseline",)
+VARIANTS = TRAINING_VARIANTS + LEGACY_EVAL_VARIANTS
+EVALUATOR_SCHEMA_VERSION = 3
+CHECKPOINT_PATTERN = re.compile(r"^(?P<prefix>.+)_(?P<steps>\d+)_steps\.zip$")
 METRIC_NOTES = {
     "fall_rate": (
         "Fraction of episodes ending with terminated=True. For Walker2d this "
@@ -51,6 +55,23 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def default_vecnormalize_path(model_path: Path) -> Path:
+    """Return the statistics file that belongs to ``model_path``.
+
+    Checkpoints keep their statistics under ``checkpoints/`` with a step
+    suffix. Falling back to the run-root ``vecnormalize.pkl`` would evaluate a
+    checkpoint with the wrong statistics, so that fallback is deliberately not
+    used here.
+    """
+    match = CHECKPOINT_PATTERN.match(model_path.name)
+    if match is not None:
+        return model_path.parent / (
+            f"{match.group('prefix')}_vecnormalize_"
+            f"{match.group('steps')}_steps.pkl"
+        )
+    return model_path.parent / "vecnormalize.pkl"
 
 
 def _read_json(path: Path) -> dict | None:
@@ -124,7 +145,13 @@ def summarize_condition(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a Walker2d PPO model.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate a Walker2d PPO model deterministically. The two current "
+            "arms are ppo-reference and truly-ppo; baseline is accepted only "
+            "for offline evaluation of historical unnormalized models."
+        )
+    )
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--variant", choices=VARIANTS, required=True)
     parser.add_argument("--episodes", type=int, default=100)
@@ -136,8 +163,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--vecnormalize", type=Path,
-        help="VecNormalize statistics for normalized variants "
-             "(default: vecnormalize.pkl next to --model).",
+        help="VecNormalize statistics for the two current arms "
+             "(default: the statistics file belonging to --model).",
     )
     parser.add_argument(
         "--conditions", nargs="+", choices=tuple(CONDITIONS),
@@ -148,13 +175,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--episodes must be at least 1")
     if not args.model.exists():
         parser.error(f"model not found: {args.model}")
-    if args.variant == "baseline":
+    if args.variant in LEGACY_EVAL_VARIANTS:
         if args.vecnormalize is not None:
-            parser.error("--vecnormalize is only valid for normalized variants")
-    else:
-        stats_path = args.vecnormalize or (args.model.parent / "vecnormalize.pkl")
-        if not stats_path.exists():
-            parser.error(f"VecNormalize statistics not found: {stats_path}")
+            parser.error(
+                "--vecnormalize is not valid for the legacy unnormalized "
+                "baseline"
+            )
+        return args
+
+    stats_path = args.vecnormalize or default_vecnormalize_path(args.model)
+    if not stats_path.exists():
+        parser.error(
+            f"VecNormalize statistics not found for {args.variant}: "
+            f"{stats_path}. Refusing to evaluate with missing or unmatched "
+            f"statistics."
+        )
+    args.vecnormalize = stats_path
     return args
 
 
@@ -166,10 +202,12 @@ def main() -> None:
     model = model_class.load(args.model, device="cpu")
     rows: list[dict[str, object]] = []
     summary: dict[str, dict[str, object]] = {}
-    normalized = args.variant != "baseline"
-    normalization_path = args.vecnormalize or (args.model.parent / "vecnormalize.pkl")
+    normalized = args.variant in TRAINING_VARIANTS
+    normalization_path = args.vecnormalize if normalized else None
     model_sha256 = file_sha256(args.model)
-    vecnormalize_sha256 = file_sha256(normalization_path) if normalized else None
+    vecnormalize_sha256 = (
+        file_sha256(normalization_path) if normalization_path else None
+    )
     training = training_metadata(args.model, args.variant)
     evaluated_at = datetime.now(timezone.utc).isoformat()
 
@@ -255,11 +293,18 @@ def main() -> None:
         "variant": args.variant,
         "normalization": {
             "enabled": normalized,
-            "vecnormalize": str(normalization_path) if normalized else None,
+            "vecnormalize": (
+                str(normalization_path) if normalization_path else None
+            ),
+            "frozen": normalized,
+            "norm_observations": normalized,
+            "norm_reward": False,
+            "legacy_unnormalized": args.variant in LEGACY_EVAL_VARIANTS,
         },
         "episodes_per_condition": args.episodes,
         "base_seed": args.seed,
         "eval_seed": args.seed,
+        "seed_protocol": "base_seed + episode_index",
         "deterministic": True,
         "evaluated_at": evaluated_at,
         "evaluator": {
